@@ -1,0 +1,35 @@
+# Handoff / internal working docs (sensitive)
+HANDOFF.md
+SPEC_GAP_ANALYSIS.md
+3DS_EPUB_Reader_Design_Document.md
+3DS_EPUB_Reader_Design_Document.docx
+
+# Secrets / credentials
+*.env
+.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets*
+*_secret*
+*credentials*
+*.token
+
+# Build artifacts
+BookReader/build/
+*.o
+*.d
+*.elf
+*.lst
+*.map
+*.3dsx
+*.smdh
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
