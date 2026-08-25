@@ -73,8 +73,8 @@ private:
     std::vector<std::string>               order_;
 
     /// Locate the End Of Central Directory record by scanning backwards.
-    bool findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount);
-    bool readCentralDirectory(long cdOffset, uint16_t cdCount);
+    bool findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount, uint32_t& cdSize);
+    bool readCentralDirectory(long cdOffset, uint16_t cdCount, uint32_t cdSize);
 
     /// Seek past an entry's local header to the first byte of its data.
     /// The local header's name/extra lengths can differ from the central

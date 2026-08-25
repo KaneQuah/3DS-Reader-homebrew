@@ -3,8 +3,6 @@
 #include <pugixml.hpp>
 #include <cstdio>
 #include <cstring>
-#include <algorithm>
-#include <functional>
 #include <unordered_map>
 #include <cctype>
 
@@ -13,6 +11,82 @@ const std::string EpubDocument::kEmpty;
 //=============================================================================
 // XHTML text extraction: strip tags, decode entities, extract visible text
 //=============================================================================
+namespace {
+
+// Block tags that should be followed by a paragraph break
+const char* const BLOCK_TAGS[] = {
+    "p","h1","h2","h3","h4","h5","h6","div","blockquote","li","pre",nullptr
+};
+// Elements whose text is metadata, not prose, and must never reach the page.
+// <desc> is the one that matters in practice: image-only cover pages wrap a
+// JPEG in an <svg> and put a bare URL in <desc>, which would otherwise be
+// rendered as the entire visible content of the book's first page.
+const char* const SKIP_TAGS[] = {
+    "script","style","svg","desc","title","head","meta","link",nullptr
+};
+
+/// ASCII case-insensitive compare against a lowercase literal. Replaces
+/// `std::string tag = child.name(); std::transform(::tolower)`, which
+/// allocated and lower-cased a std::string for every element in the document
+/// — twice per element once both tag lists were consulted.
+inline bool tagEquals(const char* tag, const char* lower) {
+    for (;; tag++, lower++) {
+        char c = *tag;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != *lower) return false;
+        if (c == 0) return true;
+    }
+}
+
+inline bool inTagList(const char* const* list, const char* tag) {
+    for (int i = 0; list[i]; i++)
+        if (tagEquals(tag, list[i])) return true;
+    return false;
+}
+
+/// Depth-first text extraction. A plain recursive function rather than the
+/// std::function-typed lambda this used to be: std::function goes through an
+/// indirect call and a heap-allocated closure on every one of the thousands of
+/// nodes in a chapter, and cannot be inlined.
+void walkForText(pugi::xml_node node, std::string& out) {
+    for (pugi::xml_node child = node.first_child(); child; child = child.next_sibling()) {
+        pugi::xml_node_type t = child.type();
+        if (t == pugi::node_pcdata || t == pugi::node_cdata) {
+            out += child.value();
+        } else if (t == pugi::node_element) {
+            const char* tag = child.name();
+            if (tagEquals(tag, "br"))            { out += "\n"; }
+            else if (inTagList(SKIP_TAGS, tag))  { /* metadata — skip */ }
+            else {
+                walkForText(child, out);
+                if (inTagList(BLOCK_TAGS, tag)) out += "\n\n";
+            }
+        }
+    }
+}
+
+/// First <body> element anywhere in the document, found by walking rather than
+/// by XPath.
+///
+/// `doc.select_node("//body")` compiles an XPath expression and then evaluates
+/// it over the entire node set on every chapter load. It is also the one
+/// pugixml API here that allocates through its own exception-free error path,
+/// which this build (-fno-exceptions, PUGIXML_NO_EXCEPTIONS) cannot report on.
+/// In practice <body> is a child of the root <html>, so the common case is two
+/// pointer hops; the recursive fallback covers documents with a wrapper
+/// element or an XML declaration in the way.
+pugi::xml_node findBody(pugi::xml_node node) {
+    for (pugi::xml_node child = node.first_child(); child; child = child.next_sibling()) {
+        if (child.type() != pugi::node_element) continue;
+        if (tagEquals(child.name(), "body")) return child;
+        pugi::xml_node deeper = findBody(child);
+        if (deeper) return deeper;
+    }
+    return pugi::xml_node();
+}
+
+} // namespace
+
 std::string epubExtractTextFromXhtml(const std::string& xhtml) {
     pugi::xml_document doc;
     // EPUB XHTML may have <!DOCTYPE> and namespace attributes
@@ -25,45 +99,17 @@ std::string epubExtractTextFromXhtml(const std::string& xhtml) {
     if (!res) return std::string();
 
     std::string out;
-    // Block tags that should be followed by a paragraph break
-    static const char* BLOCK_TAGS[] = {
-        "p","h1","h2","h3","h4","h5","h6","div","blockquote","li","pre",nullptr
-    };
-    // Elements whose text is metadata, not prose, and must never reach the page.
-    // <desc> is the one that matters in practice: image-only cover pages wrap a
-    // JPEG in an <svg> and put a bare URL in <desc>, which would otherwise be
-    // rendered as the entire visible content of the book's first page.
-    static const char* SKIP_TAGS[] = {
-        "script","style","svg","desc","title","head","meta","link",nullptr
-    };
-    auto inList = [](const char* const* list, const char* tag) {
-        for (int i = 0; list[i]; i++)
-            if (strcmp(tag, list[i]) == 0) return true;
-        return false;
-    };
-
-    std::function<void(pugi::xml_node)> walk = [&](pugi::xml_node node) {
-        for (auto child : node.children()) {
-            if (child.type() == pugi::node_pcdata) {
-                out += child.value();
-            } else if (child.type() == pugi::node_element) {
-                std::string tag = child.name();
-                std::transform(tag.begin(), tag.end(), tag.begin(), ::tolower);
-                if (tag == "br")                        { out += "\n"; }
-                else if (inList(SKIP_TAGS, tag.c_str())) { /* metadata — skip */ }
-                else {
-                    walk(child);
-                    if (inList(BLOCK_TAGS, tag.c_str())) out += "\n\n";
-                }
-            }
-        }
-    };
+    // The extracted text is always shorter than the markup it came from, and
+    // usually by a lot — but growing a string from empty to ~100 KB means a
+    // dozen reallocate-and-copy rounds. Half the markup size is a safe
+    // over-estimate that costs one allocation.
+    out.reserve(xhtml.size() / 2 + 64);
 
     // Start at <body>, not the document root: walking from the root pulls in
     // <head><title>, so every chapter's title text was being prepended to its
     // own prose. Fall back to the root for fragments that have no <body>.
-    pugi::xml_node body = doc.select_node("//body").node();
-    walk(body ? body : doc.root());
+    pugi::xml_node body = findBody(doc);
+    walkForText(body ? body : doc.root(), out);
     return out;
 }
 
@@ -71,10 +117,11 @@ std::string epubExtractTextFromXhtml(const std::string& xhtml) {
 // Count non-whitespace characters — used to decide whether a chapter carries
 // enough prose to be worth showing.
 //-----------------------------------------------------------------------------
-size_t epubCountVisibleChars(const std::string& s) {
+size_t epubCountVisibleChars(const std::string& s, size_t stopAt) {
     size_t n = 0;
-    for (unsigned char c : s)
-        if (!isspace(c)) n++;
+    for (unsigned char c : s) {
+        if (!isspace(c) && ++n >= stopAt) break;
+    }
     return n;
 }
 

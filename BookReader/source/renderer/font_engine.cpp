@@ -68,14 +68,31 @@ void FontEngine::exit() {
     if (ftFace_)  { FT_Done_Face(ftFace_);     ftFace_ = nullptr; }
     if (ftLib_)   { FT_Done_FreeType(ftLib_);  ftLib_  = nullptr; }
     if (atlasInit_) { C3D_TexDelete(&atlasTex_); atlasInit_ = false; }
+    resetGlyphCaches();
+}
+
+//-----------------------------------------------------------------------------
+// resetGlyphCaches — see font_engine.h.
+//
+// The glyph map, the ASCII fast-path pointer table and the memoised size
+// metrics all describe the same face at the same sizes, so they are only ever
+// correct together. Clearing the map on its own would leave asciiCache_
+// holding dangling pointers into freed nodes, which is a use-after-free that
+// only shows up once the atlas happens to fill mid-chapter.
+//-----------------------------------------------------------------------------
+void FontEngine::resetGlyphCaches() {
     cache_.clear();
-    cacheCount_ = 0;
+    cacheCount_     = 0;
+    asciiCacheSize_ = -1;
+    memset(asciiCache_, 0, sizeof(asciiCache_));
 }
 
 bool FontEngine::loadFont(const std::string& filename) {
     if (ftFace_) { FT_Done_Face(ftFace_); ftFace_ = nullptr; }
-    cache_.clear();
-    cacheCount_ = 0;
+    resetGlyphCaches();
+    // A new face invalidates both the programmed size and every cached metric.
+    curSize_ = -1;
+    for (auto& m : metrics_) m.valid = false;
     atlasX_ = atlasY_ = atlasRowH_ = 0;
     if (atlasInit_) memset(atlasTex_.data, 0, ATLAS_SIZE * ATLAS_SIZE);
 
@@ -97,25 +114,57 @@ bool FontEngine::loadFont(const std::string& filename) {
 
 bool FontEngine::setSize(int ptSize) {
     if (!ftFace_) return false;
+    // Already programmed — FT_Set_Char_Size would recompute the same scaling
+    // factors and hand back the same metrics. See curSize_ in font_engine.h
+    // for why skipping this is worth a branch.
+    if (ptSize == curSize_) return true;
     // 3DS top screen DPI is approximately 96 dpi; bottom screen ~91 dpi.
     // We use 96 dpi as a practical constant.
-    return FT_Set_Char_Size(ftFace_, 0, ptSize * 64, 96, 96) == 0;
+    if (FT_Set_Char_Size(ftFace_, 0, ptSize * 64, 96, 96) != 0) {
+        curSize_ = -1;
+        return false;
+    }
+    curSize_ = ptSize;
+    return true;
 }
 
-int FontEngine::ascender(int ptSize) {
-    if (!setSize(ptSize)) return ptSize;
-    return static_cast<int>(ftFace_->size->metrics.ascender >> 6);
+//-----------------------------------------------------------------------------
+// metricsFor — memoised ascender/descender/line height for one point size.
+//
+// These three numbers are fixed for a given face and size, but were being
+// re-derived from FreeType on every single call. lineHeight() in particular is
+// asked for once per line during pagination and once per line during layout;
+// ascender() once per drawText(), i.e. once per token per frame.
+//-----------------------------------------------------------------------------
+const FontEngine::SizeMetrics& FontEngine::metricsFor(int ptSize) {
+    // Out-of-table sizes (and the no-face case) get a scratch entry that is
+    // recomputed every time rather than cached — nothing in this app asks for
+    // one, but silently indexing out of bounds would be much worse.
+    static SizeMetrics scratch;
+    SizeMetrics& m = (ptSize >= 0 && ptSize <= MAX_PT_SIZE) ? metrics_[ptSize]
+                                                            : scratch;
+    if (m.valid && &m != &scratch) return m;
+
+    if (!setSize(ptSize)) {
+        // Plausible fallbacks, matching what the old per-call code returned
+        // when FreeType was unavailable.
+        m.ascender   = ptSize;
+        m.descender  = 2;
+        m.lineHeight = ptSize + 4;
+        m.valid      = false;   // retry once a face is available
+        return m;
+    }
+
+    m.ascender   = static_cast<int>(  ftFace_->size->metrics.ascender  >> 6);
+    m.descender  = static_cast<int>(-(ftFace_->size->metrics.descender >> 6));
+    m.lineHeight = static_cast<int>(  ftFace_->size->metrics.height    >> 6);
+    m.valid      = true;
+    return m;
 }
 
-int FontEngine::descender(int ptSize) {
-    if (!setSize(ptSize)) return 2;
-    return static_cast<int>(-(ftFace_->size->metrics.descender >> 6));
-}
-
-int FontEngine::lineHeight(int ptSize) {
-    if (!setSize(ptSize)) return ptSize + 4;
-    return static_cast<int>(ftFace_->size->metrics.height >> 6);
-}
+int FontEngine::ascender(int ptSize)   { return metricsFor(ptSize).ascender;   }
+int FontEngine::descender(int ptSize)  { return metricsFor(ptSize).descender;  }
+int FontEngine::lineHeight(int ptSize) { return metricsFor(ptSize).lineHeight; }
 
 //-----------------------------------------------------------------------------
 // Atlas insertion — simple shelf packing
@@ -131,8 +180,7 @@ bool FontEngine::atlasInsert(int w, int h, int& outX, int& outY) {
     if (atlasY_ + h + GLYPH_PAD > ATLAS_SIZE) {
         // Atlas full — clear and start over (simplistic; LRU eviction is better)
         atlasX_ = atlasY_ = atlasRowH_ = 0;
-        cache_.clear();
-        cacheCount_ = 0;
+        resetGlyphCaches();
         memset(atlasTex_.data, 0, ATLAS_SIZE * ATLAS_SIZE);
     }
     outX = atlasX_;
@@ -177,14 +225,59 @@ void FontEngine::uploadGlyph(int ax, int ay, FT_Bitmap& bmp) {
         }
     }
 
-    // Flush CPU cache so the GPU sees the updated texture data
+    // Deferred — see the atlasDirty_ comment in font_engine.h. The caller
+    // (textWidth()/drawText()) flushes once, after every glyph it needed has
+    // been uploaded, instead of once per glyph here.
+    atlasDirty_ = true;
+}
+
+//-----------------------------------------------------------------------------
+// flushAtlasIfDirty — one GPU cache flush per batch of new glyph uploads,
+// not one per glyph. Must be called before returning control to any code
+// that might issue a draw call referencing glyphs uploaded since the last
+// flush (textWidth() doesn't draw, but drawText() does, so both flush at
+// their own end to keep that guarantee regardless of which one triggered
+// the upload).
+//-----------------------------------------------------------------------------
+void FontEngine::flushAtlasIfDirty() {
+    if (!atlasDirty_) return;
     C3D_TexFlush(&atlasTex_);
+    atlasDirty_ = false;
 }
 
 //-----------------------------------------------------------------------------
 // Glyph cache lookup / load
+//
+// getOrLoad() is on the hot path twice over: once per character while a
+// chapter is laid out, and once per visible glyph on every rendered frame. The
+// ASCII table in front of the hash map is what makes those two loops cheap;
+// see asciiCache_ in font_engine.h.
 //-----------------------------------------------------------------------------
-GlyphInfo* FontEngine::getOrLoad(uint32_t cp, int ptSize) {
+const GlyphInfo* FontEngine::getOrLoad(uint32_t cp, int ptSize) {
+    if (cp < 128) {
+        if (ptSize != asciiCacheSize_) {
+            // The table only ever describes one size. Switching size (page
+            // text at 16pt, then the page-number label at 11pt) drops it and
+            // refills lazily, which is still far cheaper than hashing every
+            // character of the body text.
+            memset(asciiCache_, 0, sizeof(asciiCache_));
+            asciiCacheSize_ = ptSize;
+        } else if (asciiCache_[cp]) {
+            return asciiCache_[cp];
+        }
+    }
+
+    const GlyphInfo* gi = loadGlyphUncached(cp, ptSize);
+
+    // Re-check asciiCacheSize_: loadGlyphUncached() can fill the atlas, which
+    // resets every cache and sets asciiCacheSize_ back to -1. Caching `gi`
+    // then would store a pointer into a map entry that was just erased.
+    if (gi && cp < 128 && ptSize == asciiCacheSize_)
+        asciiCache_[cp] = gi;
+    return gi;
+}
+
+const GlyphInfo* FontEngine::loadGlyphUncached(uint32_t cp, int ptSize) {
     CacheKey key{ cp, ptSize };
     auto it = cache_.find(key);
     if (it != cache_.end()) return &it->second;
@@ -217,16 +310,17 @@ GlyphInfo* FontEngine::getOrLoad(uint32_t cp, int ptSize) {
     // Evict oldest if cache full
     if (cacheCount_ >= GLYPH_CACHE_MAX) evictOldest();
 
-    cache_[key]  = gi;
+    // emplace() hands back an iterator to the stored node, so the value can be
+    // returned without a second hash lookup.
+    auto ins = cache_.emplace(key, gi);
     cacheCount_++;
-    return &cache_[key];
+    return &ins.first->second;
 }
 
 void FontEngine::evictOldest() {
     // Simple strategy: clear entire cache when full.
     // A production implementation would use an LRU list.
-    cache_.clear();
-    cacheCount_ = 0;
+    resetGlyphCaches();
     atlasX_ = atlasY_ = atlasRowH_ = 0;
     if (atlasInit_) memset(atlasTex_.data, 0, ATLAS_SIZE * ATLAS_SIZE);
 }
@@ -235,7 +329,7 @@ void FontEngine::evictOldest() {
 // Measure
 //-----------------------------------------------------------------------------
 int FontEngine::glyphAdvance(uint32_t cp) {
-    GlyphInfo* gi = getOrLoad(cp, 16); // use current font size — caller should call textWidth
+    const GlyphInfo* gi = getOrLoad(cp, 16); // use current font size — caller should call textWidth
     return gi ? gi->advance : 8;
 }
 
@@ -244,9 +338,10 @@ int FontEngine::textWidth(const std::string& utf8, int ptSize) {
     const char* p = utf8.c_str();
     uint32_t cp;
     while ((cp = utf8Next(p)) != 0) {
-        GlyphInfo* gi = getOrLoad(cp, ptSize);
+        const GlyphInfo* gi = getOrLoad(cp, ptSize);
         if (gi) total += gi->advance;
     }
+    flushAtlasIfDirty();
     return total;
 }
 
@@ -256,36 +351,47 @@ int FontEngine::textWidth(const std::string& utf8, int ptSize) {
 // C2D coordinates are in landscape framebuffer space; the projection matrix
 // applied in reader_view.cpp maps portrait→landscape.
 //-----------------------------------------------------------------------------
-void FontEngine::drawText(const std::string& utf8, float px, float py, u32 colour, int ptSize) {
+void FontEngine::drawText(const std::string& utf8, float px, float py, u32 colour, int ptSize,
+                          float depth) {
     if (!atlasInit_) return;
+    const SizeMetrics& sm = metricsFor(ptSize);
     float penX = px;
-    float penY = py + ascender(ptSize);  // shift baseline down from top of line
+    float penY = py + sm.ascender;  // shift baseline down from top of line
+
+    // The tint is the same for every glyph in the string, so build it once.
+    // C2D_PlainImageTint fills four corner colours plus four blend factors;
+    // doing that per character was ~600 redundant struct fills per spread per
+    // frame.
+    C2D_ImageTint tint;
+    C2D_PlainImageTint(&tint, colour, 1.0f);
+
+    // Likewise the image header: only the subtexture rectangle changes between
+    // glyphs, and `img.subtex` points at `sub`, so both can be hoisted.
+    C2D_Image         img;
+    Tex3DS_SubTexture sub;
+    img.tex    = &atlasTex_;
+    img.subtex = &sub;
 
     const char* p = utf8.c_str();
     uint32_t cp;
     while ((cp = utf8Next(p)) != 0) {
-        if (cp == '\n') { penX = px; penY += lineHeight(ptSize); continue; }
+        if (cp == '\n') { penX = px; penY += sm.lineHeight; continue; }
 
-        GlyphInfo* gi = getOrLoad(cp, ptSize);
+        const GlyphInfo* gi = getOrLoad(cp, ptSize);
         if (!gi) continue;
 
         if (gi->width > 0 && gi->height > 0) {
             float gx = penX + gi->bearingX;
             float gy = penY - gi->bearingY;
 
-            // Build sub-image from atlas
-            C2D_Image img;
-            img.tex    = &atlasTex_;
             // Normalised UVs. The atlas is addressed top-down (row 0 = top),
             // while texture V runs bottom-up, hence the 1.0 - y/size flip.
-            Tex3DS_SubTexture sub;
             sub.width  = (u16)gi->width;
             sub.height = (u16)gi->height;
             sub.left   = (float)gi->atlasX / ATLAS_SIZE;
             sub.top    = 1.0f - (float)gi->atlasY / ATLAS_SIZE;
             sub.right  = (float)(gi->atlasX + gi->width)  / ATLAS_SIZE;
             sub.bottom = 1.0f - (float)(gi->atlasY + gi->height) / ATLAS_SIZE;
-            img.subtex = &sub;
 
             // The last two args of C2D_DrawImageAt are SCALE FACTORS, not a
             // pixel size — the drawn size is scale * subtex->width. Passing the
@@ -295,15 +401,14 @@ void FontEngine::drawText(const std::string& utf8, float px, float py, u32 colou
             //
             // The tint supplies the text colour: the A8 atlas contributes only
             // coverage (alpha), so without a tint the glyph would draw black
-            // regardless of the requested colour.
-            C2D_ImageTint tint;
-            C2D_PlainImageTint(&tint, colour, 1.0f);
-
-            C2D_DrawImageAt(img, gx, gy, 0.5f, &tint, 1.0f, 1.0f);
+            // regardless of the requested colour. Built once above the loop.
+            C2D_DrawImageAt(img, gx, gy, depth, &tint, 1.0f, 1.0f);
         }
 
         penX += gi->advance;
     }
+
+    flushAtlasIfDirty();
 }
 
 //-----------------------------------------------------------------------------

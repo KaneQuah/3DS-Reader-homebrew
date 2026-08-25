@@ -80,6 +80,13 @@ static std::string jsonEscape(const std::string& s) {
     return out;
 }
 
+bool ProgressStore::saveIfDirty(const char* path) {
+    if (!dirty_) return false;
+    if (!save(path)) return false;
+    dirty_ = false;
+    return true;
+}
+
 bool ProgressStore::save(const char* path) const {
     // Write to .tmp then rename (atomic)
     std::string tmp = std::string(path) + ".tmp";
@@ -233,7 +240,13 @@ bool ProgressStore::load(const char* path) {
         }
         entries_[key] = bp;
     }
+    // Freshly read from disk: memory and file agree.
+    dirty_ = false;
     return true;
+}
+
+std::string ProgressStore::keyFor(const std::string& bookPath) {
+    return sha1Hex(bookPath);
 }
 
 const BookProgress* ProgressStore::get(const std::string& bookPath) const {
@@ -243,8 +256,35 @@ const BookProgress* ProgressStore::get(const std::string& bookPath) const {
     return &it->second;
 }
 
+//-----------------------------------------------------------------------------
+// Equality over the fields that actually get persisted. Used to decide whether
+// a set() is a real change — see the write-behind note in progress.h.
+//-----------------------------------------------------------------------------
+static bool sameProgress(const BookProgress& a, const BookProgress& b) {
+    return a.chapter       == b.chapter       &&
+           a.spread        == b.spread        &&
+           a.scroll_offset == b.scroll_offset &&
+           a.chapter_count == b.chapter_count &&
+           a.path          == b.path          &&
+           a.bookmarks     == b.bookmarks;
+}
+
 void ProgressStore::set(const BookProgress& bp) {
-    auto key       = sha1Hex(bp.path);
-    entries_[key]  = bp;
-    entries_[key].path = bp.path;  // ensure path is stored
+    set(sha1Hex(bp.path), bp);
+}
+
+void ProgressStore::set(const std::string& key, const BookProgress& bp) {
+    auto it = entries_.find(key);
+    if (it != entries_.end() && sameProgress(it->second, bp)) {
+        // Nothing changed — most page turns re-save an entry identical to the
+        // one already held (progress is written on the queue *and* again once
+        // the deferred load completes). Marking the store dirty here would
+        // schedule an SD write with nothing new to say.
+        return;
+    }
+
+    BookProgress& slot = (it != entries_.end()) ? it->second : entries_[key];
+    slot      = bp;
+    slot.path = bp.path;   // ensure path is stored
+    dirty_    = true;
 }

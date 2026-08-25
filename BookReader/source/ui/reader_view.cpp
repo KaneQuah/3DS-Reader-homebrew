@@ -1,5 +1,6 @@
 #include "ui/reader_view.h"
 #include "trace.h"
+#include "perf.h"
 #include "renderer/font_engine.h"
 #include "renderer/page_layout.h"
 #include "formats/epub_parser.h"
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <utility>
 #include <citro3d.h>
 
 ReaderView g_reader;
@@ -90,49 +92,113 @@ const std::string& ReaderView::chapterTextAt(int i) {
     return txtText_;   // TXT: single chapter
 }
 
+// "No prose" cannot mean "empty string": image-only cover pages are an SVG
+// wrapping a JPEG, and typically carry a stray caption or URL in metadata.
+// Those produce a handful of characters and would otherwise be presented as
+// the book's first page. Anything under kMinChapterChars visible (i.e.
+// non-whitespace) characters is treated as front matter and stepped over.
+static constexpr size_t kMinChapterChars = 120;
+
 //-----------------------------------------------------------------------------
-// loadChapter — fetch text, lay it out, position the cursor
+// resolveReadableChapter — see reader_view.h.
 //
-// This is the only expensive operation in the reader, and its cost is bounded
-// by one chapter rather than by the size of the book.
+// Only the index is carried through the probe loop, never a reference into
+// the chapter cache: the cache holds three slots and recycles them, so a
+// reference taken here would silently start pointing at a different
+// chapter's text after three probes.
 //-----------------------------------------------------------------------------
-bool ReaderView::loadChapter(int index, bool landOnLastSpread) {
-    if (index < 0 || index >= chapterCount_) return false;
-    TRACE("loadChapter(%d, back=%d) of %d", index, (int)landOnLastSpread, chapterCount_);
-
-    // Skip over chapters with no real prose, in the direction of travel, so a
-    // page turn never lands on a blank-looking screen.
-    //
-    // "No prose" cannot mean "empty string": image-only cover pages are an SVG
-    // wrapping a JPEG, and typically carry a stray caption or URL in metadata.
-    // Those produce a handful of characters and would otherwise be presented as
-    // the book's first page. Anything under MIN_CHAPTER_CHARS visible (i.e.
-    // non-whitespace) characters is treated as front matter and stepped over.
-    //
-    // Only the index is carried through the probe loop, never a reference into
-    // the chapter cache: the cache holds three slots and recycles them, so a
-    // reference taken here would silently start pointing at a different
-    // chapter's text after three probes.
-    static constexpr size_t MIN_CHAPTER_CHARS = 120;
-
-    int step  = landOnLastSpread ? -1 : +1;
+int ReaderView::resolveReadableChapter(int index, int step) {
     int probe = index;
-    while (epubCountVisibleChars(chapterTextAt(probe)) < MIN_CHAPTER_CHARS) {
+    // The count is only ever compared against kMinChapterChars, so stop there
+    // rather than scanning a whole chapter to find out it has 40,000
+    // characters when 120 would have answered the question.
+    while (epubCountVisibleChars(chapterTextAt(probe), kMinChapterChars) < kMinChapterChars) {
         int next = probe + step;
         if (next < 0 || next >= chapterCount_) {
             // Nothing substantial in that direction. Fall back to the requested
             // chapter if it has any text at all, rather than refusing to open a
             // book made entirely of short sections.
-            if (!chapterTextAt(index).empty()) { probe = index; break; }
-            TRACE("  no readable chapter found from %d", index);
-            return false;
+            if (!chapterTextAt(index).empty()) return index;
+            return -1;
         }
         probe = next;
     }
+    return probe;
+}
 
-    curChapter_ = probe;
+//-----------------------------------------------------------------------------
+// queueNextPrefetch — see "Next-chapter prefetch" in reader_view.h.
+//-----------------------------------------------------------------------------
+void ReaderView::queueNextPrefetch() {
+    if (isFixedLayout_) return;   // PDF doesn't use PageLayout at all
+    int next = curChapter_ + 1;
+    if (next >= chapterCount_) { prefetchQueuedFor_ = -1; return; }
+    // Already cached, under either the index that was requested or the one the
+    // probe resolved to.
+    if (next == prefetchChapter_ || next == prefetchRequestedFor_) {
+        prefetchQueuedFor_ = -1;
+        return;
+    }
+    prefetchQueuedFor_ = next;
+}
+
+//-----------------------------------------------------------------------------
+// servicePrefetch — see reader_view.h. Must be called between frames, same
+// as servicePendingWork(), and only when hasPendingWork() is false.
+//-----------------------------------------------------------------------------
+void ReaderView::servicePrefetch() {
+    int target = prefetchQueuedFor_;
+    prefetchQueuedFor_ = -1;
+    if (isFixedLayout_ || target < 0 || target >= chapterCount_) return;
+
+    int probe = resolveReadableChapter(target, +1);
+    if (probe < 0 || probe == prefetchChapter_) return;
+
+    // Remember the index the *caller* will ask for, not just the one the probe
+    // landed on — see prefetchRequestedFor_ in reader_view.h.
+    prefetchRequestedFor_ = target;
+
     const std::string& text = chapterTextAt(probe);
-    TRACE("  chapter %d has %u chars", probe, (unsigned)text.size());
+    TRACE("prefetch: chapter %d has %u chars", probe, (unsigned)text.size());
+
+    int margin = g_config.marginPx();
+    int pw = PORTRAIT_TOP_W - margin * 2;
+    int ph = PORTRAIT_TOP_H - margin * 2 - 24;
+
+    prefetchLayout_.run(text, pw, ph,
+                        g_config.font_size, g_config.lineSpacingMul(),
+                        g_config.justify, isNew3DS_);
+
+    if (prefetchLayout_.pageCount() == 0) {
+        // Same "produced nothing" case loadChapter() guards against — leave
+        // the prefetch empty rather than caching a layout for a page count
+        // of zero; loadChapter() will just recompute for real when it gets
+        // there (resolveReadableChapter() should normally have already
+        // steered around this, so this is a belt-and-braces fallback).
+        TRACE("  prefetch chapter %d laid out to zero pages, discarding", probe);
+        prefetchChapter_      = -1;
+        prefetchRequestedFor_ = -1;
+        return;
+    }
+
+    prefetchChapter_ = probe;
+    TRACE("  prefetch done: chapter %d, %u pages", probe, (unsigned)prefetchLayout_.pageCount());
+}
+
+//-----------------------------------------------------------------------------
+// loadChapter — fetch text, lay it out, position the cursor
+//
+// This is the only expensive operation in the reader, and its cost is bounded
+// by one chapter rather than by the size of the book — except when the
+// target chapter matches a completed prefetch (see reader_view.h), in which
+// case it's a move-assignment instead of a FreeType run.
+//-----------------------------------------------------------------------------
+bool ReaderView::loadChapter(int index, bool landOnLastSpread) {
+    if (index < 0 || index >= chapterCount_) return false;
+    TRACE("loadChapter(%d, back=%d) of %d", index, (int)landOnLastSpread, chapterCount_);
+
+    const u64 tStart = perfNow();
+    lastLoad_ = LoadTiming{};
 
     int margin = g_config.marginPx();
     topPageW_  = PORTRAIT_TOP_W - margin * 2;
@@ -140,25 +206,89 @@ bool ReaderView::loadChapter(int index, bool landOnLastSpread) {
     botPageW_  = PORTRAIT_BOT_W - margin * 2;
     botPageH_  = PORTRAIT_BOT_H - margin * 2 - 24;
 
+    // Prefetch hit: the forward-turn common case. The layout for this exact
+    // chapter was already computed while the user was sitting on the
+    // previous page — swap it in and skip FreeType entirely. Only valid
+    // going forward (landOnLastSpread means a backward turn, which this
+    // feature deliberately doesn't cover — see reader_view.h).
+    //
+    // This test deliberately runs BEFORE resolveReadableChapter(), and matches
+    // on the requested index rather than the resolved one. The probe is what
+    // pulls chapter text through the ZIP-inflate/XHTML-parse path, so running
+    // it first meant the "skip the expensive work" branch had already done a
+    // decompress and a DOM walk before it could decide to skip anything —
+    // which is a good candidate for why the prefetch, though it was landing,
+    // did not make turns feel any faster. servicePrefetch() already resolved
+    // this index; prefetchChapter_ is the answer it got.
+    if (!landOnLastSpread && index == prefetchRequestedFor_ &&
+        prefetchChapter_ >= 0 && prefetchLayout_.pageCount() > 0) {
+        TRACE("  prefetch hit for chapter %d (requested %d), skipping layout",
+              prefetchChapter_, index);
+        curChapter_ = prefetchChapter_;
+        g_layout    = std::move(prefetchLayout_);
+        prefetchChapter_      = -1;
+        prefetchRequestedFor_ = -1;
+
+        totalSpreads_ = ((int)g_layout.pageCount() + 1) / 2;
+        spread_       = 0;
+        queueNextPrefetch();
+
+        lastLoad_.prefetchHit = true;
+        lastLoad_.total       = perfMsSince(tStart);
+        return true;
+    }
+
+    int step  = landOnLastSpread ? -1 : +1;
+    const u64 tText = perfNow();
+    int probe = resolveReadableChapter(index, step);
+    if (probe < 0) {
+        TRACE("  no readable chapter found from %d", index);
+        return false;
+    }
+
+    curChapter_ = probe;
+
+    const std::string& text = chapterTextAt(probe);
+    lastLoad_.text = perfMsSince(tText);
+    TRACE("  chapter %d has %u chars (text %.0f ms)", probe, (unsigned)text.size(),
+          (double)lastLoad_.text);
     TRACE("  layout start (w=%d h=%d pt=%d)", topPageW_, topPageH_, g_config.font_size);
 
     // New 3DS has the headroom for Knuth-Plass line breaking; Old 3DS uses greedy.
+    const u64 tLayout = perfNow();
     g_layout.run(text, topPageW_, topPageH_,
                  g_config.font_size, g_config.lineSpacingMul(),
                  g_config.justify, isNew3DS_);
+    lastLoad_.layout = perfMsSince(tLayout);
 
-    TRACE("  layout done: %u pages", (unsigned)g_layout.pageCount());
+    TRACE("  layout done: %u pages (%.0f ms)", (unsigned)g_layout.pageCount(),
+          (double)lastLoad_.layout);
 
     // A chapter that produced no pages must not be presented: totalSpreads_ was
     // previously clamped up to 1 here, which left the renderer indexing into an
     // empty page list.
+    //
+    // curChapter_ was already set to `probe` above, so on this failure path it
+    // now names a chapter whose g_layout is empty — but totalSpreads_/spread_
+    // still held whatever the *previous* successful chapter left behind. That
+    // mismatch let nextSpread()/prevSpread() keep incrementing spread_ against
+    // a stale totalSpreads_ that no longer described anything, paging through
+    // a chapter that only ever renders blank. Reset both here so the empty
+    // chapter's state is internally consistent even though open()/nextSpread()
+    // report failure and the caller falls back to whatever it was already
+    // showing.
     if (g_layout.pageCount() == 0) {
         TRACE("  chapter %d laid out to zero pages", probe);
+        totalSpreads_ = 0;
+        spread_       = 0;
+        lastLoad_.total = perfMsSince(tStart);
         return false;
     }
 
     totalSpreads_ = ((int)g_layout.pageCount() + 1) / 2;
     spread_       = landOnLastSpread ? totalSpreads_ - 1 : 0;
+    queueNextPrefetch();
+    lastLoad_.total = perfMsSince(tStart);
     return true;
 }
 
@@ -186,6 +316,13 @@ std::string ReaderView::currentChapterTitle() const {
 void ReaderView::close() {
     if (docType_ == DocType::PDF) g_pdfRenderer.close();
     g_layout.clear();
+    prefetchLayout_.clear();
+    prefetchChapter_      = -1;
+    prefetchQueuedFor_    = -1;
+    prefetchRequestedFor_ = -1;
+    progressPath_.clear();
+    progressKey_.clear();
+    lastLoad_ = LoadTiming{};
     txtText_.clear();
     txtText_.shrink_to_fit();
     epub_.close();
@@ -318,14 +455,14 @@ void ReaderView::renderReflowPage(C3D_RenderTarget* target, int pageIndex,
         const Line& line = lines[li];
         int x = margin;
 
-        // Justification: distribute extra space among spaces on non-last lines
+        // Justification: distribute extra space among spaces on non-last lines.
+        // line.spaceCount is recorded when the line is broken (see
+        // page_layout.h) — this used to re-walk every token on every line of
+        // every frame to count them again.
         int extraPerSpace = 0;
-        int spaceCount    = 0;
-        if (g_config.justify && !line.isLastInPara && line.totalWidth < contentW) {
-            for (int ti : line.tokenIndices)
-                if (toks[ti].type == TokenType::Space) spaceCount++;
-            if (spaceCount > 0)
-                extraPerSpace = (contentW - line.totalWidth) / spaceCount;
+        if (g_config.justify && !line.isLastInPara && line.totalWidth < contentW &&
+            line.spaceCount > 0) {
+            extraPerSpace = (contentW - line.totalWidth) / line.spaceCount;
         }
 
         for (int ti : line.tokenIndices) {
@@ -386,6 +523,15 @@ void ReaderView::renderPageMeta(C3D_RenderTarget* target, int pageIndex,
                                  int portW, int portH, const Theme& theme) {
     int totalPages = isFixedLayout_ ? g_pdfRenderer.pageCount()
                                     : (int)g_layout.pageCount();
+
+    // A spread's recto index is spread*2+1, which does not exist whenever the
+    // chapter's page count is odd — exactly the spread you land on when paging
+    // backward into the end of a chapter (loadChapter(..., landOnLastSpread)).
+    // renderReflowPage already no-ops for an out-of-range pageIndex and leaves
+    // that side blank; this label must agree, or it reports a page number
+    // ("P. 6 / 5") for a page that was never laid out.
+    if (pageIndex < 0 || pageIndex >= totalPages) return;
+
     char buf[64];
     snprintf(buf, sizeof(buf), "P. %d / %d", pageIndex + 1, totalPages);
     int textW = g_fontEngine.textWidth(buf, 11);
@@ -413,8 +559,11 @@ void ReaderView::renderToast(C3D_RenderTarget* target, const Theme& theme) {
     float tx = (PORTRAIT_BOT_W - tw) / 2.0f;
     C2D_DrawRectSolid(tx - 4, PORTRAIT_TOP_H - 36, 0.8f, tw + 8, 22,
                       C2D_Color32(0, 0, 0, alpha));
+    // Depth must be >= the box above (0.8f), or citro2d's GEQUAL depth test
+    // culls the glyphs behind their own background — same bug as the overlay
+    // panel (see font_engine.h drawText comment).
     g_fontEngine.drawText(toastMsg_, tx, PORTRAIT_TOP_H - 33,
-                          C2D_Color32(255, 255, 255, alpha), 13);
+                          C2D_Color32(255, 255, 255, alpha), 13, 0.85f);
 }
 
 void ReaderView::setToast(const std::string& msg) {
@@ -425,22 +574,30 @@ void ReaderView::setToast(const std::string& msg) {
 //-----------------------------------------------------------------------------
 // Navigation
 //-----------------------------------------------------------------------------
-void ReaderView::nextSpread() {
-    if (spread_ < totalSpreads_ - 1) { spread_++; return; }
+bool ReaderView::nextSpread() {
+    if (spread_ < totalSpreads_ - 1) { spread_++; return true; }
 
-    // At the end of the chapter: roll into the next one. loadChapter() lands on
-    // spread 0 and skips any empty chapters ahead of us.
-    if (!isFixedLayout_ && curChapter_ + 1 < chapterCount_)
-        loadChapter(curChapter_ + 1);
+    // At the end of the chapter: queue a roll into the next one. Actually
+    // loading it is deferred — see "Deferred layout work" in reader_view.h —
+    // since it means FreeType layout and GPU texture-atlas flushes, which
+    // must not happen inside the open frame this is called from.
+    if (!isFixedLayout_ && curChapter_ + 1 < chapterCount_) {
+        pendingChapterIndex_     = curChapter_ + 1;
+        pendingLandOnLastSpread_ = false;
+    }
+    return false;
 }
 
-void ReaderView::prevSpread() {
-    if (spread_ > 0) { spread_--; return; }
+bool ReaderView::prevSpread() {
+    if (spread_ > 0) { spread_--; return true; }
 
-    // At the start of the chapter: roll back into the previous one, landing on
-    // its final spread so reading backwards is continuous.
-    if (!isFixedLayout_ && curChapter_ > 0)
-        loadChapter(curChapter_ - 1, /*landOnLastSpread=*/true);
+    // At the start of the chapter: queue a roll back into the previous one,
+    // landing on its final spread so reading backwards is continuous.
+    if (!isFixedLayout_ && curChapter_ > 0) {
+        pendingChapterIndex_     = curChapter_ - 1;
+        pendingLandOnLastSpread_ = true;
+    }
+    return false;
 }
 
 void ReaderView::goToPosition(int chapter, int spread) {
@@ -449,9 +606,33 @@ void ReaderView::goToPosition(int chapter, int spread) {
         return;
     }
     if (chapter != curChapter_) {
-        if (!loadChapter(chapter)) return;
+        // Deferred — loading a different chapter is the same expensive,
+        // GPU-flushing work as a chapter-boundary page turn.
+        pendingChapterIndex_     = chapter;
+        pendingLandOnLastSpread_ = false;
+        pendingGotoSpread_       = spread;
+        return;
     }
     spread_ = std::max(0, std::min(totalSpreads_ - 1, spread));
+}
+
+//-----------------------------------------------------------------------------
+// servicePendingWork — must be called between frames (no open C3D frame).
+// See "Deferred layout work" in reader_view.h.
+//-----------------------------------------------------------------------------
+void ReaderView::servicePendingWork() {
+    if (pendingChapterIndex_ != PENDING_NONE) {
+        int  chapter   = pendingChapterIndex_;
+        bool landLast  = pendingLandOnLastSpread_;
+        int  gotoSpr   = pendingGotoSpread_;
+        pendingChapterIndex_ = PENDING_NONE;
+        pendingGotoSpread_   = -1;
+        if (loadChapter(chapter, landLast) && gotoSpr >= 0)
+            spread_ = std::max(0, std::min(totalSpreads_ - 1, gotoSpr));
+    } else if (pendingRelayout_) {
+        relayoutCurrentChapter();
+    }
+    pendingRelayout_ = false;
 }
 
 //-----------------------------------------------------------------------------
@@ -462,28 +643,79 @@ bool ReaderView::update(u32 keysDown, u32 keysHeld,
                         const GyroHandler& gyro) {
     bool navigated = false;
 
-    // D-Pad / shoulder buttons
-    if ((keysDown & KEY_R) || (keysDown & KEY_DRIGHT)) { nextSpread(); navigated = true; }
-    if ((keysDown & KEY_L) || (keysDown & KEY_DLEFT))  { prevSpread(); navigated = true; }
+    // Page-turn controls. nextSpread()/prevSpread() return false when the
+    // turn crossed a chapter boundary and was queued rather than applied
+    // immediately (see reader_view.h) — in that case there is nothing to
+    // report as "navigated" yet, so saveProgress()/TTS in main.cpp don't fire
+    // on stale (pre-load) state. servicePendingWork() handles that once the
+    // deferred load actually completes.
+    //
+    // Reflowable (EPUB/TXT): Up = prev spread, Down = next spread. Left/Right
+    // (D-Pad and L/R shoulder) are deliberately inert now — requested change
+    // from the L/R + D-Pad-Left/Right scheme, not yet verified on hardware.
+    //
+    // PDF fixed-layout keeps the old L/R shoulder scheme instead, since
+    // Up/Down there are already the (held-key) zoom-pan controls below and
+    // binding page-turn to the same keys would fight with panning.
+    if (!isFixedLayout_) {
+        if (keysDown & KEY_DDOWN) navigated |= nextSpread();
+        if (keysDown & KEY_DUP)   navigated |= prevSpread();
+    } else {
+        // Fixed layout keeps the L/R shoulder scheme — but not while B is
+        // held. L+R+B is the app-exit combo (see main.cpp), and a PDF reader
+        // that jumped two pages on the way out would save the wrong position
+        // as its parting act.
+        if (!(keysHeld & KEY_B)) {
+            if (keysDown & KEY_R) navigated |= nextSpread();
+            if (keysDown & KEY_L) navigated |= prevSpread();
+        }
+    }
 
     // D-Pad Up/Down: fine scroll for PDF zoom
     if (isFixedLayout_ && g_pdfRenderer.zoomEnabled()) {
         if (keysHeld & KEY_DUP)   g_pdfRenderer.pan(0, -4);
         if (keysHeld & KEY_DDOWN) g_pdfRenderer.pan(0,  4);
-        if (keysHeld & KEY_CSTICK_UP)   g_pdfRenderer.pan(0, -2);
-        if (keysHeld & KEY_CSTICK_DOWN) g_pdfRenderer.pan(0,  2);
+        // C-Stick fine-scroll (design doc §11.7) is deliberately DISABLED for
+        // now. Smooth within-page scrolling is only worth having once a page
+        // can be produced quickly; while chapter layout still costs seconds,
+        // a finer-grained scroll control just gives the user more ways to
+        // trigger the stall. Re-enable once the page-turn performance work
+        // lands — the pan() calls it needs are still here.
     }
 
     // Touch gestures
+    //
+    // hidTouchRead() reports the bottom screen's NATIVE LANDSCAPE coordinates:
+    // px in 0..319 across the physical width, py in 0..239 down the physical
+    // height. The console is held rotated 90° anti-clockwise, and the reader
+    // draws into a 240×320 portrait space that setupPortraitProjection() then
+    // rotates a further 180°. So the axis that runs across the *page width* is
+    // py, and the axis that runs *down the page* is px — swapped relative to
+    // the hardware, and both inverted by that 180° rotation.
+    //
+    // TouchHandler works entirely in portrait space (it splits left/right at
+    // BOT_MID_X = 120 of 240). Converting once here, at the boundary, keeps
+    // that assumption true and is the same transform the overlay will need if
+    // it is ever converted off its landscape coordinates.
+    //
+    // Previously the raw landscape `touch` was passed straight through, so the
+    // tap left/right split fell at 120 of 320 — 37% across, along the axis that
+    // runs down the page — and swipe detection measured vertical finger travel.
+    touchPosition portraitTouch{};
+    if (touch.px != 0 || touch.py != 0) {
+        portraitTouch.px = (u16)(PORTRAIT_BOT_W - 1 - touch.py);   // across page width, 0..239
+        portraitTouch.py = (u16)(PORTRAIT_BOT_H - 1 - touch.px);   // down the page,     0..319
+    }
+
     static touchPosition lastTouch{};
-    TouchGesture gesture = s_touch.update(touch, lastTouch, touchDown, touchReleased);
-    lastTouch = touch;
+    TouchGesture gesture = s_touch.update(portraitTouch, lastTouch, touchDown, touchReleased);
+    lastTouch = portraitTouch;
 
     switch (gesture) {
         case TouchGesture::SwipeLeft:
-        case TouchGesture::TapRight:  nextSpread(); navigated = true; break;
+        case TouchGesture::TapRight:  navigated |= nextSpread(); break;
         case TouchGesture::SwipeRight:
-        case TouchGesture::TapLeft:   prevSpread(); navigated = true; break;
+        case TouchGesture::TapLeft:   navigated |= prevSpread(); break;
         default: break;
     }
 
@@ -526,6 +758,8 @@ void ReaderView::tickAutoScroll(int pagesPerMin) {
 // Save progress
 //-----------------------------------------------------------------------------
 void ReaderView::saveProgress(const std::string& path) {
+    if (path.empty()) return;
+
     BookProgress bp;
     bp.path          = path;
     bp.chapter       = curChapter_;
@@ -533,8 +767,16 @@ void ReaderView::saveProgress(const std::string& path) {
     bp.chapter_count = chapterCount_;
     bp.scroll_offset = 0;
     bp.bookmarks     = bookmarks_;
-    g_progress.set(bp);
-    g_progress.save(PROGRESS_PATH);
+
+    // In-memory only. The SD write is batched behind ProgressStore's dirty
+    // flag — see the write-behind note in progress.h and flushProgress() in
+    // main.cpp. This used to call g_progress.save() straight through, on every
+    // page turn.
+    if (path != progressPath_) {
+        progressPath_ = path;
+        progressKey_  = ProgressStore::keyFor(path);
+    }
+    g_progress.set(progressKey_, bp);
 }
 
 //-----------------------------------------------------------------------------

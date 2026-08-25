@@ -86,10 +86,15 @@ static const Theme THEME_SEPIA  = { C2D_Color32(242,234,210,255), C2D_Color32(60
 //-----------------------------------------------------------------------------
 // App state enum — drives the main loop dispatch
 //-----------------------------------------------------------------------------
+// Note: there is deliberately no `Settings` state. The settings overlay is not
+// a state of the application — it is drawn *over* whichever state is active
+// (file browser or reader), which both continue to render underneath it. It
+// tracks its own visibility via OverlayPanel::isOpen(). A `Settings` value was
+// declared here originally and never assigned by anything; it is gone rather
+// than left as a trap for whoever next writes a switch over this enum.
 enum class AppState {
     FileBrowser,
     Reading,
-    Settings,
     Error,
 };
 

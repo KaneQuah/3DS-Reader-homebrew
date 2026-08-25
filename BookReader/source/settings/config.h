@@ -15,11 +15,28 @@ struct Config {
     bool        justify     = false;
 
     // [Controls]
-    bool orientation_lock   = false;
+    // Gyro-based auto-flip (see gyro_handler.cpp) has swapped the screens'
+    // left/right roles unprompted on real hardware even after adding
+    // stationary-drift rejection. Defaulting to locked means new installs
+    // never see a surprise flip; auto-detect is available as an explicit
+    // opt-in via the Orientation row in Settings.
+    bool orientation_lock   = true;
 
     // [Reader]
     int  auto_scroll_speed  = 0;   // 0 = off, 1–10 pages/min
     int  bright_level       = 3;   // 1–5
+
+    // Report how long a chapter load actually took, as a toast on the top
+    // screen ("Chapter load 812 ms — text 190, layout 610").
+    //
+    // Page-turn speed has been the project's open problem across several
+    // sessions, and it has been chased twice from symptoms rather than
+    // numbers. TRACE() is the usual measuring tool, but it writes to the SD
+    // card and fflush()es every line, so it distorts exactly the timings that
+    // matter — and it is compiled out of release builds entirely. This is the
+    // one channel that reports real hardware timings from a normal
+    // ENABLE_TRACE=0 build. Off by default; toggled from Settings.
+    bool show_timings       = false;
 
     // [TTS]
     bool        tts_enabled = false;

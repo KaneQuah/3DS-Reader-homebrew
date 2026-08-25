@@ -50,12 +50,25 @@ APP_AUTHOR      :=  BookReader Project
 # Override on the command line, e.g.:   make ENABLE_PDF=1
 #---------------------------------------------------------------------------------
 #   ENABLE_TRACE=1 writes a step-by-step log to /3DS/BookReader/trace.log,
-#                 flushed and closed after every line so it survives a hang.
-#                 Set to 0 for release builds — it is very slow.
+#                 fflush()ed after every line so it survives a hang. That flush
+#                 is a real SD-card write on this hardware — a FAT
+#                 read-modify-write of a sector, on a card that benchmarks
+#                 around class 4 — so a build with tracing on measures the
+#                 logging as much as the thing being logged.
+#
+#                 DEFAULT IS NOW 0. It used to default to 1, which meant every
+#                 build handed to hardware for a page-turn-speed test was
+#                 paying for a dozen-plus flushed SD writes per turn. Turn it
+#                 back on deliberately when diagnosing a hang or a crash:
+#
+#                     make ENABLE_TRACE=1
+#
+#                 For timing numbers from a normal build, use the on-screen
+#                 readout instead: Settings > Show Timings (Config::show_timings).
 #---------------------------------------------------------------------------------
 ENABLE_PDF      ?=  0
 ENABLE_TTS      ?=  0
-ENABLE_TRACE    ?=  1
+ENABLE_TRACE    ?=  0
 
 #---------------------------------------------------------------------------------
 # Code-generation options

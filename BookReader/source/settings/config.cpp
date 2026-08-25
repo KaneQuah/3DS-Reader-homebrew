@@ -75,6 +75,7 @@ bool Config::load(const char* path) {
         } else if (section == "Reader") {
             if      (key == "auto_scroll_speed") auto_scroll_speed = std::stoi(val);
             else if (key == "bright_level")      bright_level      = std::stoi(val);
+            else if (key == "show_timings")      show_timings      = (val == "true");
         } else if (section == "TTS") {
             if      (key == "tts_enabled") tts_enabled = (val == "true");
             else if (key == "tts_speed")   tts_speed   = std::stoi(val);
@@ -104,6 +105,7 @@ bool Config::save(const char* path) const {
         "[Reader]\n"
         "auto_scroll_speed = %d\n"
         "bright_level = %d\n"
+        "show_timings = %s\n"
         "\n"
         "[TTS]\n"
         "tts_enabled = %s\n"
@@ -118,6 +120,7 @@ bool Config::save(const char* path) const {
         orientation_lock ? "true" : "false",
         auto_scroll_speed,
         bright_level,
+        show_timings ? "true" : "false",
         tts_enabled ? "true" : "false",
         tts_speed,
         tts_voice.c_str()

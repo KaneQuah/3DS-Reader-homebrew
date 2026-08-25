@@ -53,8 +53,9 @@ bool ZipArchive::open(const std::string& path) {
 
     long     cdOffset = 0;
     uint16_t cdCount  = 0;
-    if (!findEndOfCentralDirectory(cdOffset, cdCount)) { close(); return false; }
-    if (!readCentralDirectory(cdOffset, cdCount))      { close(); return false; }
+    uint32_t cdSize   = 0;
+    if (!findEndOfCentralDirectory(cdOffset, cdCount, cdSize))  { close(); return false; }
+    if (!readCentralDirectory(cdOffset, cdCount, cdSize))       { close(); return false; }
 
     return true;
 }
@@ -66,7 +67,7 @@ bool ZipArchive::open(const std::string& path) {
 // 64 KB may follow it, so we read the tail into memory and scan backwards for
 // the signature.
 //-----------------------------------------------------------------------------
-bool ZipArchive::findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount) {
+bool ZipArchive::findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount, uint32_t& cdSize) {
     if (fseek(file_, 0, SEEK_END) != 0) return false;
     long fileSize = ftell(file_);
     if (fileSize < EOCD_MIN_SIZE) return false;
@@ -85,7 +86,7 @@ bool ZipArchive::findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount) {
 
         const uint8_t* e = &tail[(size_t)i];
         cdCount  = rd16(e + 10);          // entries in this disk
-        uint32_t cdSize   = rd32(e + 12);
+        cdSize   = rd32(e + 12);
         uint32_t cdStart  = rd32(e + 16);
 
         // ZIP64 sentinel — we do not support it, and misreading it would be
@@ -101,31 +102,46 @@ bool ZipArchive::findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount) {
 
 //-----------------------------------------------------------------------------
 // readCentralDirectory
+//
+// Previously issued up to three stdio calls per entry (fread the 46-byte
+// header, fread the name, fseek past extra+comment) — 1187 entries meant
+// ~3500 separate stdio round trips, measured at 5.8s to index even with a
+// 32KB setvbuf buffer. The central directory is one contiguous block on
+// disk; read all `cdSize` bytes in a single fread and parse the in-memory
+// copy instead, so indexing costs one big SD read plus pure CPU work.
 //-----------------------------------------------------------------------------
-bool ZipArchive::readCentralDirectory(long cdOffset, uint16_t cdCount) {
+bool ZipArchive::readCentralDirectory(long cdOffset, uint16_t cdCount, uint32_t cdSize) {
     if (fseek(file_, cdOffset, SEEK_SET) != 0) return false;
+
+    std::vector<uint8_t> buf(cdSize);
+    if (cdSize > 0 && fread(buf.data(), 1, cdSize, file_) != cdSize) return false;
 
     entries_.reserve(cdCount);
     order_.reserve(cdCount);
 
-    uint8_t hdr[46];
+    const uint8_t* p   = buf.data();
+    const uint8_t* end = buf.data() + buf.size();
+
     for (uint16_t i = 0; i < cdCount; i++) {
-        if (fread(hdr, 1, sizeof(hdr), file_) != sizeof(hdr)) return false;
-        if (rd32(hdr) != SIG_CDFH) return false;
+        if (end - p < 46) return false;   // truncated central directory
+        if (rd32(p) != SIG_CDFH) return false;
 
         Entry e;
-        e.flags             = rd16(hdr + 8);
-        e.method            = rd16(hdr + 10);
-        e.compressedSize    = rd32(hdr + 20);
-        e.uncompressedSize  = rd32(hdr + 24);
-        uint16_t nameLen    = rd16(hdr + 28);
-        uint16_t extraLen   = rd16(hdr + 30);
-        uint16_t commentLen = rd16(hdr + 32);
-        e.localHeaderOffset = rd32(hdr + 42);
+        e.flags             = rd16(p + 8);
+        e.method            = rd16(p + 10);
+        e.compressedSize    = rd32(p + 20);
+        e.uncompressedSize  = rd32(p + 24);
+        uint16_t nameLen    = rd16(p + 28);
+        uint16_t extraLen   = rd16(p + 30);
+        uint16_t commentLen = rd16(p + 32);
+        e.localHeaderOffset = rd32(p + 42);
+        p += 46;
 
-        std::string name(nameLen, '\0');
-        if (nameLen && fread(&name[0], 1, nameLen, file_) != nameLen) return false;
-        if (fseek(file_, extraLen + commentLen, SEEK_CUR) != 0) return false;
+        long tailLen = (long)nameLen + (long)extraLen + (long)commentLen;
+        if (end - p < tailLen) return false;   // truncated central directory
+
+        std::string name(reinterpret_cast<const char*>(p), nameLen);
+        p += tailLen;
 
         // Skip encrypted entries and directory markers rather than failing the
         // whole archive — a stray entry should not make a book unreadable.

@@ -37,7 +37,14 @@ TouchGesture TouchHandler::update(const touchPosition& cur, const touchPosition&
 
         // Tap: little movement, short duration
         if (maxDeltaX_ < TAP_MAX_MOVE_PX && holdFrames_ < TAP_MAX_FRAMES) {
-            // startX_ is in portrait coordinates: 0..239 across the screen width
+            // startX_ is portrait X, 0..239 across the page width.
+            //
+            // The CALLER owns the conversion from the hardware's landscape
+            // touch coordinates (px 0..319, py 0..239) into portrait space —
+            // see ReaderView::update(). This class must never be handed a raw
+            // touchPosition straight out of hidTouchRead(), or the split below
+            // lands on the wrong axis at the wrong midpoint, which is exactly
+            // the bug that made taps and swipes unreliable on hardware.
             return (startX_ < BOT_MID_X) ? TouchGesture::TapLeft : TouchGesture::TapRight;
         }
     }

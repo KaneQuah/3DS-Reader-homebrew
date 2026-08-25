@@ -29,14 +29,28 @@ void PageLayout::tokenise(const std::string& utf8, int ptSize) {
     const char* p = utf8.c_str();
     std::string cur;
 
+    // The space glyph's advance is the same for every space in the chapter.
+    // Measuring it per space meant a full textWidth() call — UTF-8 decode,
+    // glyph lookup, atlas dirty check — roughly once every six characters of
+    // the book.
+    const int spaceW = g_fontEngine.textWidth(" ", ptSize);
+
+    // English prose averages a little under 3 characters per token once spaces
+    // are counted as tokens of their own. Reserving up front avoids the
+    // repeated grow-and-copy of a vector whose elements each own a std::string,
+    // which is the expensive kind of reallocation.
+    tokens_.reserve(utf8.size() / 3 + 16);
+
     auto flushWord = [&]() {
         if (cur.empty()) return;
         Token t;
         t.type  = TokenType::Word;
-        t.text  = cur;
         t.width = g_fontEngine.textWidth(cur, ptSize);
-        tokens_.push_back(t);
-        cur.clear();
+        // Move, don't copy: `cur` is cleared immediately afterwards either way,
+        // so the word's buffer can be handed straight to the token.
+        t.text  = std::move(cur);
+        tokens_.push_back(std::move(t));
+        cur.clear();   // moved-from strings are valid but unspecified
     };
 
     uint32_t cp;
@@ -54,8 +68,7 @@ void PageLayout::tokenise(const std::string& utf8, int ptSize) {
             tokens_.push_back(t);
         } else if (cp == ' ' || cp == '\t' || cp == 0x00A0 /* NBSP */) {
             flushWord();
-            int spW = g_fontEngine.textWidth(" ", ptSize);
-            tokens_.push_back({ TokenType::Space, " ", spW });
+            tokens_.push_back({ TokenType::Space, " ", spaceW });
         } else {
             // Encode cp back to UTF-8 for the word buffer
             if (cp < 0x80) {
@@ -83,27 +96,41 @@ void PageLayout::tokenise(const std::string& utf8, int ptSize) {
 //-----------------------------------------------------------------------------
 void PageLayout::greedyBreak(int pageW, int ptSize) {
     int spaceW = g_fontEngine.textWidth(" ", ptSize);
+
+    // Each Line owns a heap-allocated vector of token indices, and pushing one
+    // by value allocated a second copy of that vector before the original was
+    // cleared — two allocations and a copy per line. `emitLine` moves instead,
+    // so the buffer curLine built is handed straight to lines_.
+    lines_.reserve(tokens_.size() / 8 + 16);
+
     Line curLine;
     curLine.totalWidth    = 0;
     curLine.isLastInPara  = false;
+    curLine.spaceCount    = 0;
     bool lineStart = true;
+
+    auto emitLine = [&](bool lastInPara) {
+        curLine.isLastInPara = lastInPara;
+        lines_.push_back(std::move(curLine));
+        curLine.tokenIndices.clear();
+        curLine.totalWidth  = 0;
+        curLine.spaceCount  = 0;
+        curLine.isPageBreak = false;
+    };
 
     for (int i = 0; i < (int)tokens_.size(); i++) {
         const Token& tok = tokens_[i];
 
         if (tok.type == TokenType::PageBreak || tok.type == TokenType::Newline) {
-            if (!curLine.tokenIndices.empty()) {
-                curLine.isLastInPara = true;
-                lines_.push_back(curLine);
-                curLine.tokenIndices.clear();
-                curLine.totalWidth = 0;
-            }
+            if (!curLine.tokenIndices.empty()) emitLine(true);
             if (tok.type == TokenType::PageBreak) {
-                // Sentinel line to force page break
+                // Marker line: carries no tokens, is never rendered, and ends
+                // the page it lands on. See Line::isPageBreak in page_layout.h
+                // for why this is a flag rather than an out-of-range width.
                 Line pb;
                 pb.isLastInPara = true;
-                pb.totalWidth   = pageW + 1;  // overwide → triggers page break
-                lines_.push_back(pb);
+                pb.isPageBreak  = true;
+                lines_.push_back(std::move(pb));
             }
             lineStart = true;
             continue;
@@ -113,24 +140,19 @@ void PageLayout::greedyBreak(int pageW, int ptSize) {
             if (lineStart) continue;  // skip leading space
             int newW = curLine.totalWidth + spaceW + (i+1 < (int)tokens_.size() ? tokens_[i+1].width : 0);
             if (newW > pageW && !curLine.tokenIndices.empty()) {
-                curLine.isLastInPara = false;
-                lines_.push_back(curLine);
-                curLine.tokenIndices.clear();
-                curLine.totalWidth = 0;
+                emitLine(false);
                 lineStart = true;
             } else {
                 curLine.tokenIndices.push_back(i);
                 curLine.totalWidth += spaceW;
+                curLine.spaceCount++;
             }
             continue;
         }
 
         // Word token
         if (!lineStart && curLine.totalWidth + tok.width > pageW) {
-            curLine.isLastInPara = false;
-            lines_.push_back(curLine);
-            curLine.tokenIndices.clear();
-            curLine.totalWidth = 0;
+            emitLine(false);
             lineStart = true;
         }
         curLine.tokenIndices.push_back(i);
@@ -138,10 +160,7 @@ void PageLayout::greedyBreak(int pageW, int ptSize) {
         lineStart = false;
     }
 
-    if (!curLine.tokenIndices.empty()) {
-        curLine.isLastInPara = true;
-        lines_.push_back(curLine);
-    }
+    if (!curLine.tokenIndices.empty()) emitLine(true);
 }
 
 void PageLayout::breakLines(int pageW, int ptSize, bool justify, bool useKnuthPlass) {
@@ -163,8 +182,10 @@ void PageLayout::paginateLines(int pageH, int ptSize, float lineSpacingMul) {
     cur.lineEnd   = 0;
 
     for (size_t i = 0; i < lines_.size(); i++) {
-        // Overwide sentinel = forced page break
-        if (lines_[i].totalWidth > pageH * 10) {
+        // Explicit page break: close the current page and resume *after* the
+        // marker, so it never becomes part of a page's line range and never
+        // reaches the renderer.
+        if (lines_[i].isPageBreak) {
             if (cur.lineStart < i) { cur.lineEnd = i; pages_.push_back(cur); }
             cur.lineStart = i + 1;
             cur.lineEnd   = i + 1;

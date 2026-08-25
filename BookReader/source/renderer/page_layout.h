@@ -25,9 +25,28 @@ struct Token {
 // Line — a sequence of tokens that fits on one line
 //-----------------------------------------------------------------------------
 struct Line {
-    std::vector<int> tokenIndices;  // indices into the token array
-    int              totalWidth;
-    bool             isLastInPara;  // suppress justification on last line
+    std::vector<int> tokenIndices;      // indices into the token array
+    int              totalWidth  = 0;
+    bool             isLastInPara = false;  // suppress justification on last line
+
+    // Number of Space tokens on this line. Justification needs it to divide
+    // the slack evenly, and it never changes once the line is broken — but
+    // renderReflowPage() used to recount it by walking tokenIndices on every
+    // line of every frame. Recorded once here instead.
+    int              spaceCount  = 0;
+
+    /// This is not a line of text: it is a marker emitted for an explicit page
+    /// break (a form feed in the source), and paginateLines() ends the current
+    /// page on it. It carries no tokens and is never rendered.
+    ///
+    /// Previously the marker was encoded by giving the line an impossible
+    /// width — `totalWidth = pageW + 1` — and paginateLines() looked for it
+    /// with `totalWidth > pageH * 10`. Those are two different dimensions:
+    /// with normal margins the marker was written as ~221 and tested against
+    /// ~3560, so the branch never fired and explicit page breaks were silently
+    /// dropped. A flag says what is meant instead of encoding it in a value
+    /// that has to be compared against an unrelated one.
+    bool             isPageBreak = false;
 };
 
 //-----------------------------------------------------------------------------

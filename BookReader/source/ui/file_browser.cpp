@@ -206,6 +206,11 @@ std::string FileBrowser::update(u32 keysDown, u32 keysHeld,
                                  std::string* longPressPath) {
     ctxAction_ = ContextAction::None;
 
+    // keysHeld is currently unused: the only held-key binding in the browser
+    // was C-Stick list scrolling, now disabled (see below). The parameter is
+    // kept so re-enabling it does not require touching the call site.
+    (void)keysHeld;
+
     // --- Context menu input ---
     if (ctxMenuOpen_) {
         if (keysDown & KEY_DUP)   { ctxSel_ = std::max(0, ctxSel_ - 1); }
@@ -228,8 +233,12 @@ std::string FileBrowser::update(u32 keysDown, u32 keysHeld,
     int prev = selected_;
     if (keysDown & KEY_DUP)        { selected_--; }
     if (keysDown & KEY_DDOWN)      { selected_++; }
-    if (keysHeld & KEY_CSTICK_UP)  { selected_--; }
-    if (keysHeld & KEY_CSTICK_DOWN){ selected_++; }
+    // C-Stick list navigation is deliberately DISABLED for now. It was bound
+    // to keysHeld, so it moved one row per frame — 60 rows/second, which
+    // overshoots any real library instantly and is unusable. Deferred rather
+    // than repaired: selecting a book is only the cheap half of the action,
+    // and until opening one is fast, a faster way to scroll the list is not
+    // the bottleneck. D-Pad Up/Down (above) remains the supported path.
     selected_ = std::max(0, std::min((int)entries_.size() - 1, selected_));
     if (selected_ != prev) ensureVisible();
 

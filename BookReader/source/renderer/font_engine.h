@@ -53,8 +53,13 @@ public:
     // Measure the pixel width of a UTF-8 string
     int  textWidth(const std::string& utf8, int ptSize);
 
-    // Render a UTF-8 string at portrait canvas position (px, py) in colour `colour`
-    void drawText(const std::string& utf8, float px, float py, u32 colour, int ptSize);
+    // Render a UTF-8 string at portrait canvas position (px, py) in colour `colour`.
+    // `depth` follows the same convention as C2D_Draw*'s z argument (citro2d's
+    // depth test passes GEQUAL, so higher values draw in front). Callers layering
+    // text over their own background rects must pass a depth at or above that
+    // rect's, or the glyphs are depth-culled and nothing appears — see overlay.cpp.
+    void drawText(const std::string& utf8, float px, float py, u32 colour, int ptSize,
+                  float depth = 0.5f);
 
     // Current font metrics at given size
     int  ascender(int ptSize);
@@ -81,6 +86,50 @@ private:
     FT_Library  ftLib_      = nullptr;
     FT_Face     ftFace_     = nullptr;
 
+    // Size currently programmed into ftFace_, so setSize() can skip the
+    // FT_Set_Char_Size round trip when nothing has changed. -1 means unknown
+    // (no face loaded yet, or the face was just replaced).
+    //
+    // This matters far more than it looks: ascender() called setSize()
+    // unconditionally, and drawText() calls ascender() once per call, and
+    // renderReflowPage() calls drawText() once per *token*. A full spread of
+    // prose is ~600 tokens, so a steady 60 fps was re-programming the
+    // FreeType size ~36,000 times a second to get back a number that had not
+    // changed since the last font-size change.
+    int         curSize_    = -1;
+
+    // Per-size font metrics, memoised. Indexed by point size directly; sizes
+    // outside the table fall through to a live FreeType query.
+    static constexpr int MAX_PT_SIZE = 64;
+    struct SizeMetrics {
+        int  ascender   = 0;
+        int  descender  = 0;
+        int  lineHeight = 0;
+        bool valid      = false;
+    };
+    SizeMetrics metrics_[MAX_PT_SIZE + 1];
+    const SizeMetrics& metricsFor(int ptSize);
+
+    // Direct-mapped ASCII glyph cache for the size most recently requested.
+    //
+    // getOrLoad()'s unordered_map lookup (build a CacheKey, hash it, walk the
+    // bucket, compare) runs once per character of every measurement and every
+    // draw — twice over the whole chapter during layout, then again for every
+    // visible glyph on every frame. Latin prose is ~99% ASCII, so a 128-entry
+    // pointer table keyed on the current size removes almost all of that.
+    //
+    // Storing raw pointers is safe: std::unordered_map is node-based, so
+    // pointers to mapped values stay valid across insertion and rehashing.
+    // They are only invalidated when the map itself is cleared, which is what
+    // resetGlyphCaches() exists to keep in sync.
+    const GlyphInfo* asciiCache_[128] = {};
+    int              asciiCacheSize_  = -1;
+
+    /// Drop the glyph cache, the atlas cursor and the ASCII fast path
+    /// together. Every place that clears one must clear all three, or the
+    /// fast path hands out pointers into a map that no longer has them.
+    void        resetGlyphCaches();
+
     std::unordered_map<CacheKey, GlyphInfo, CacheKeyHash> cache_;
     int         cacheOrder_[GLYPH_CACHE_MAX];  // LRU eviction order (indices)
     int         cacheCount_ = 0;
@@ -92,9 +141,29 @@ private:
     int         atlasY_     = 0;
     int         atlasRowH_  = 0;  // tallest glyph in current row
 
+    // uploadGlyph() used to call C3D_TexFlush (a full 512x512 cache flush)
+    // after every single new glyph. A chapter's worth of layout touches
+    // every unique (codepoint, size) pair exactly once — maybe ~100 for a
+    // page of English prose — so that was up to ~100 full-atlas flushes
+    // serialised into the ~800ms/chapter layout cost the handoff measured.
+    // Glyphs are batched instead: uploadGlyph() only marks the atlas dirty,
+    // and textWidth()/drawText() flush once each, after all the glyphs *that
+    // call* needed have been uploaded but before returning — i.e. still
+    // strictly before anything the caller does with those glyphs, just no
+    // longer once per character.
+    bool        atlasDirty_ = false;
+    void        flushAtlasIfDirty();
+
     // Helpers
     bool        setSize(int ptSize);
-    GlyphInfo*  getOrLoad(uint32_t codepoint, int ptSize);
+
+    /// Glyph lookup with the ASCII fast path in front of it. The returned
+    /// pointer is owned by cache_ and stays valid until the cache is reset.
+    const GlyphInfo* getOrLoad(uint32_t codepoint, int ptSize);
+
+    /// The slow path: unordered_map lookup, then a FreeType render and atlas
+    /// upload on a miss. Called only by getOrLoad().
+    const GlyphInfo* loadGlyphUncached(uint32_t codepoint, int ptSize);
     void        evictOldest();
     bool        atlasInsert(int w, int h, int& outX, int& outY);
     void        uploadGlyph(int atlasX, int atlasY, FT_Bitmap& bmp);

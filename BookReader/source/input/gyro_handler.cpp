@@ -13,10 +13,21 @@ void GyroHandler::init() {
     pendingFlip_   = false;
     orientation_   = Orientation::Normal;
     flipAnimFrames_ = 0;
+    stillPolls_    = 0;
 }
 
 void GyroHandler::exit() {
     HIDUSER_DisableGyroscope();
+}
+
+// See the header for why orientation_ survives this and rollDeg_ does not.
+void GyroHandler::resync() {
+    lastTick_       = svcGetSystemTick();
+    rollDeg_        = 0.0f;
+    debounceCount_  = 0;
+    pendingFlip_    = false;
+    stillPolls_     = 0;
+    flipAnimFrames_ = 0;
 }
 
 bool GyroHandler::update(bool orientationLock) {
@@ -41,7 +52,18 @@ bool GyroHandler::update(bool orientationLock) {
     // libctru reports roll around Y when the 3DS is in its natural landscape position)
     // Convert mrad/s → deg/s: factor = 1000 * (180/π)^-1 ≈ 0.01745 rad per mrad → deg/s
     float rollRateDegsPerSec = static_cast<float>(rate.y) * (180.0f / (float)M_PI) / 1000.0f;
-    rollDeg_ += rollRateDegsPerSec * dtS;
+
+    // Below the noise/bias floor, treat the console as stationary rather than
+    // integrating whatever small nonzero reading the sensor happens to give.
+    // If it stays that way for STILL_RESET_POLLS, snap the integrator back to
+    // zero — a real rotation would have crossed the flip threshold *during*
+    // the motion, not shown up later while sitting still.
+    if (std::fabs(rollRateDegsPerSec) < STILL_RATE_DEG_S) {
+        if (++stillPolls_ >= STILL_RESET_POLLS) rollDeg_ = 0.0f;
+    } else {
+        stillPolls_ = 0;
+        rollDeg_ += rollRateDegsPerSec * dtS;
+    }
 
     // Normalise to [-180, 180]
     while (rollDeg_ >  180.0f) rollDeg_ -= 360.0f;

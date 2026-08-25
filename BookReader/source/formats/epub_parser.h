@@ -125,5 +125,13 @@ private:
 /// when it lazily materialises a chapter.
 std::string epubExtractTextFromXhtml(const std::string& xhtml);
 
-/// Count non-whitespace characters in a string.
-size_t epubCountVisibleChars(const std::string& s);
+/// Count non-whitespace characters in a string, stopping once `stopAt` have
+/// been seen.
+///
+/// Every caller only ever asks "does this have at least N?", so counting the
+/// whole string is wasted work — a full-length chapter answers that question
+/// in its first hundred bytes but was being scanned end to end, once per
+/// chapter probed by ReaderView::resolveReadableChapter(). The default keeps
+/// the original count-everything behaviour for any caller that wants it.
+size_t epubCountVisibleChars(const std::string& s,
+                             size_t stopAt = (size_t)-1);
