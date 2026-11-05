@@ -114,6 +114,62 @@ static void flushProgress() {
 }
 
 //=============================================================================
+// Shutdown
+//
+// There used to be two copies of this sequence: one in the APTHOOK_ONEXIT
+// branch of aptHookCallback() below, and one after aptMainLoop() returns. Both
+// ran C2D_Fini / C3D_Fini / gfxExit and the service *Exit calls, and neither
+// knew about the other — so whichever way the app closed, one of the two was
+// wrong:
+//
+//   • if the hook fires while the exit request is being handled and the loop
+//     then falls out, the post-loop copy tears everything down a second time:
+//     C3D_Fini frees its buffers twice, and the refcounted services
+//     (cfguExit, ptmuExit, gspLcdExit) decrement past zero;
+//   • if the hook never fires, the carefully written branch in it was dead
+//     code that only looked like it was providing a graceful exit.
+//
+// One function with an idempotency guard answers both. Calling it twice is
+// harmless, which is what makes it safe to call from the hook AND after the
+// loop without having to know which path ran first.
+//
+// Order matters in one place: FontEngine::exit() calls C3D_TexDelete on the
+// glyph atlas, so it has to run before C3D_Fini().
+//=============================================================================
+static bool s_shutdownDone = false;
+
+static void shutdownAll() {
+    if (s_shutdownDone) return;
+    s_shutdownDone = true;
+
+    TRACE("=== shutdown ===");
+
+    // Persist everything first — this is the last chance.
+    if (!s_openPath.empty()) g_reader.saveProgress(s_openPath);
+    flushProgress();
+    g_config.save();
+
+    // Subsystems.
+    g_tts.stop();
+    g_tts.exit();
+    s_gyro.exit();
+    g_reader.close();
+    g_pdfRenderer.close();
+    g_fontEngine.exit();   // C3D_TexDelete — must precede C3D_Fini()
+
+    // Graphics.
+    C2D_Fini();
+    C3D_Fini();
+    gfxExit();
+
+    // Services.
+    ptmuExit();
+    gspLcdExit();
+    cfguExit();
+    romfsExit();
+}
+
+//=============================================================================
 // APT hook callback — handles sleep, wake, home, and exit events
 //=============================================================================
 static void aptHookCallback(APT_HookType type, void* /*param*/) {
@@ -181,23 +237,9 @@ static void aptHookCallback(APT_HookType type, void* /*param*/) {
             break;
 
         case APTHOOK_ONEXIT:
-            // Full graceful shutdown
-            if (!s_openPath.empty()) g_reader.saveProgress(s_openPath);
-            flushProgress();
-            g_config.save();
-            g_tts.stop();
-            g_tts.exit();
-            s_gyro.exit();
-            g_fontEngine.exit();
-            g_reader.close();
-            g_pdfRenderer.close();
-            C2D_Fini();
-            C3D_Fini();
-            gfxExit();
-            romfsExit();
-            ptmuExit();
-            gspLcdExit();
-            cfguExit();
+            // Full graceful shutdown. Guarded and shared with the post-loop
+            // path — see shutdownAll().
+            shutdownAll();
             break;
 
         default:
@@ -445,6 +487,16 @@ int main() {
         if (++s_autosaveCounter >= AUTOSAVE_FRAMES) {
             s_autosaveCounter = 0;
             flushProgress();
+        }
+
+        //--- Deferred software keyboard -------------------------------------
+        // Go-To ▸ Y asks for the system keyboard; the applet is launched here,
+        // between frames, because it suspends the app and takes the GPU. The
+        // panel reports what was typed through its next update() call, so the
+        // Go-To handling in the state machine below is unchanged.
+        if (g_overlay.keyboardRequested()) {
+            g_overlay.serviceKeyboard();
+            continue;   // start a clean frame next iteration
         }
 
         //--- Deferred font change -------------------------------------------
@@ -811,28 +863,13 @@ int main() {
 
     //=========================================================================
     // Graceful shutdown
+    //
+    // Unhook first, so nothing can re-enter the callback while the teardown is
+    // in progress, then run the one shared shutdown. If APTHOOK_ONEXIT already
+    // ran it, this is a no-op rather than a second teardown.
     //=========================================================================
     aptUnhook(&s_aptHook);
-
-    if (!s_openPath.empty()) g_reader.saveProgress(s_openPath);
-    flushProgress();
-    g_config.save();
-
-    g_tts.stop();
-    g_tts.exit();
-    s_gyro.exit();
-
-    g_reader.close();
-    g_pdfRenderer.close();
-    g_fontEngine.exit();
-
-    C2D_Fini();
-    C3D_Fini();
-    gfxExit();
-    ptmuExit();
-    gspLcdExit();
-    cfguExit();
-    romfsExit();
+    shutdownAll();
 
     return 0;
 }

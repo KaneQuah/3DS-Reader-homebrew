@@ -2,6 +2,8 @@
 #include <zlib.h>
 #include <cstring>
 #include <algorithm>
+#include <memory>
+#include <new>
 
 namespace {
 
@@ -28,6 +30,28 @@ constexpr long EOCD_MAX_SCAN = 22 + 65535;
 // copy and a full uncompressed copy of a large chapter at once.
 constexpr size_t INFLATE_CHUNK = 16 * 1024;
 
+//-----------------------------------------------------------------------------
+// Largest single entry this reader will materialise in RAM.
+//
+// Entry sizes come straight out of the file, as 32-bit fields, and were used
+// as allocation sizes with no checking at all:
+//
+//     std::vector<uint8_t> buf(cdSize);        // central directory
+//     out.resize(e.uncompressedSize);          // entry contents
+//
+// A corrupt or hostile archive declaring 0xFFFFFFFE asks for a 4 GB
+// allocation on a console with 64 MB of RAM. The project is built with
+// -fno-exceptions, so the resulting std::bad_alloc / std::length_error cannot
+// be caught: it calls std::terminate, and the app dies instead of reporting
+// "Failed to open EPUB" on the error screen it already has.
+//
+// A chapter of XHTML is tens of kilobytes. 16 MB is orders of magnitude above
+// anything legitimate while being small enough to allocate, so it rejects the
+// absurd without refusing any real book. It also caps what a compression bomb
+// can expand to, since the entry is sized from the header before inflating.
+//-----------------------------------------------------------------------------
+constexpr uint32_t MAX_ENTRY_BYTES = 16u * 1024 * 1024;
+
 } // namespace
 
 ZipArchive::~ZipArchive() { close(); }
@@ -36,6 +60,7 @@ void ZipArchive::close() {
     if (file_) { fclose(file_); file_ = nullptr; }
     entries_.clear();
     order_.clear();
+    fileSize_ = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -50,6 +75,10 @@ bool ZipArchive::open(const std::string& path) {
     // A large stdio buffer turns the central-directory walk into a handful of
     // big SD reads instead of thousands of small ones.
     setvbuf(file_, nullptr, _IOFBF, 32 * 1024);
+
+    if (fseek(file_, 0, SEEK_END) != 0) { close(); return false; }
+    fileSize_ = ftell(file_);
+    if (fileSize_ < EOCD_MIN_SIZE)      { close(); return false; }
 
     long     cdOffset = 0;
     uint16_t cdCount  = 0;
@@ -68,10 +97,9 @@ bool ZipArchive::open(const std::string& path) {
 // the signature.
 //-----------------------------------------------------------------------------
 bool ZipArchive::findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount, uint32_t& cdSize) {
-    if (fseek(file_, 0, SEEK_END) != 0) return false;
-    long fileSize = ftell(file_);
-    if (fileSize < EOCD_MIN_SIZE) return false;
-
+    // open() has already measured the file and rejected one too short to hold
+    // an EOCD record.
+    const long fileSize = fileSize_;
     long scanLen = std::min<long>(fileSize, EOCD_MAX_SCAN);
     long scanPos = fileSize - scanLen;
 
@@ -111,16 +139,27 @@ bool ZipArchive::findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount, ui
 // copy instead, so indexing costs one big SD read plus pure CPU work.
 //-----------------------------------------------------------------------------
 bool ZipArchive::readCentralDirectory(long cdOffset, uint16_t cdCount, uint32_t cdSize) {
+    // The central directory has to lie inside the file. Checking this first
+    // means the allocation below is bounded by the real file size rather than
+    // by whatever the EOCD record claims.
+    if (cdSize == 0) return false;
+    if (cdOffset < 0 || cdOffset > fileSize_) return false;
+    if ((long)cdSize > fileSize_ - cdOffset) return false;
+
     if (fseek(file_, cdOffset, SEEK_SET) != 0) return false;
 
-    std::vector<uint8_t> buf(cdSize);
-    if (cdSize > 0 && fread(buf.data(), 1, cdSize, file_) != cdSize) return false;
+    // Allocated with nothrow: std::vector would throw std::bad_alloc on
+    // failure, which -fno-exceptions turns into std::terminate. Here a failed
+    // allocation is just an unreadable book.
+    std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[cdSize]);
+    if (!buf) return false;
+    if (fread(buf.get(), 1, cdSize, file_) != cdSize) return false;
 
     entries_.reserve(cdCount);
     order_.reserve(cdCount);
 
-    const uint8_t* p   = buf.data();
-    const uint8_t* end = buf.data() + buf.size();
+    const uint8_t* p   = buf.get();
+    const uint8_t* end = buf.get() + cdSize;
 
     for (uint16_t i = 0; i < cdCount; i++) {
         if (end - p < 46) return false;   // truncated central directory
@@ -147,6 +186,16 @@ bool ZipArchive::readCentralDirectory(long cdOffset, uint16_t cdCount, uint32_t 
         // whole archive — a stray entry should not make a book unreadable.
         if (e.flags & FLAG_ENCRYPTED) continue;
         if (!name.empty() && name.back() == '/') continue;
+
+        // Same treatment for an entry whose header is not credible: its
+        // compressed data cannot be longer than the file that contains it, its
+        // local header has to be inside that file, and nothing legitimate is
+        // bigger than MAX_ENTRY_BYTES. Dropping just the entry means one bad
+        // record costs a chapter, not the whole book — and read() cannot then
+        // be handed a size that would abort the app.
+        if (e.localHeaderOffset > (uint32_t)fileSize_)      continue;
+        if ((long)e.compressedSize > fileSize_)             continue;
+        if (e.uncompressedSize > MAX_ENTRY_BYTES)           continue;
 
         if (entries_.emplace(name, e).second)
             order_.push_back(name);
@@ -182,6 +231,12 @@ bool ZipArchive::read(const std::string& name, std::string& out) {
     auto it = entries_.find(name);
     if (it == entries_.end()) return false;
     const Entry& e = it->second;
+
+    // readCentralDirectory() drops entries that fail this, so reaching it here
+    // would mean a bug rather than a bad file — but this is the line that
+    // actually allocates, and a 32-bit size field straight from the archive is
+    // exactly what must never reach it unchecked. See MAX_ENTRY_BYTES.
+    if (e.uncompressedSize > MAX_ENTRY_BYTES) return false;
 
     if (!seekToEntryData(e)) return false;
 

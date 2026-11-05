@@ -87,8 +87,32 @@ bool ProgressStore::saveIfDirty(const char* path) {
     return true;
 }
 
+//-----------------------------------------------------------------------------
+// save
+//
+// Write to <path>.tmp, then move it over the real file, so a crash mid-write
+// cannot leave a half-written progress.json.
+//
+// Two things were wrong with the move:
+//
+//   • rename() on this platform does NOT replace an existing destination. The
+//     SD card is served by libctru's devoptab, whose rename maps to
+//     FSUSER_RenameFile, and that returns an error when the target path
+//     already exists. The old file therefore has to be removed first.
+//   • the return value was discarded, so save() reported success regardless.
+//
+// Together those mean every save after the very first one silently did
+// nothing: progress.json kept its original contents, a stale progress.json.tmp
+// accumulated beside it, and saveIfDirty() cleared the dirty flag as though
+// the write had landed. Reading position, bookmarks and chapter counts were
+// all affected — and because the failure was silent, the whole write-behind
+// design above was resting on a call that never completed.
+//
+// remove()-then-rename() is correct on any platform, including ones whose
+// rename does replace: the only cost is a window where neither file exists,
+// which load() covers by falling back to the temporary.
+//-----------------------------------------------------------------------------
 bool ProgressStore::save(const char* path) const {
-    // Write to .tmp then rename (atomic)
     std::string tmp = std::string(path) + ".tmp";
     FILE* f = fopen(tmp.c_str(), "w");
     if (!f) return false;
@@ -116,10 +140,23 @@ bool ProgressStore::save(const char* path) const {
     }
 
     fprintf(f, "\n  }\n}\n");
-    fclose(f);
 
-    // Atomic rename
-    rename(tmp.c_str(), path);
+    // Check for a write error before replacing good data with this file. A
+    // full SD card fails here, and renaming a truncated progress.json over an
+    // intact one would turn "could not save" into "lost everything saved so
+    // far".
+    bool ok = (ferror(f) == 0);
+    if (fclose(f) != 0) ok = false;
+    if (!ok) {
+        remove(tmp.c_str());
+        return false;
+    }
+
+    // See the comment above this function for why the destination is removed
+    // first and why the result is checked.
+    remove(path);
+    if (rename(tmp.c_str(), path) != 0) return false;
+
     return true;
 }
 
@@ -217,7 +254,15 @@ static bool skipValue(const char*& p) {
 
 bool ProgressStore::load(const char* path) {
     FILE* f = fopen(path, "r");
-    if (!f) return false;
+    if (!f) {
+        // save() removes the old file before moving the temporary into place,
+        // so a power loss in that window leaves only <path>.tmp — which holds
+        // a complete, already-flushed store. Prefer it to starting the user's
+        // library over from zero.
+        std::string tmp = std::string(path) + ".tmp";
+        f = fopen(tmp.c_str(), "r");
+        if (!f) return false;
+    }
 
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);

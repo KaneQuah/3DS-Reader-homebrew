@@ -20,6 +20,11 @@ void OverlayPanel::close() {
     open_ = false;
     lastTouchX_ = -1;
     lastTouchY_ = -1;
+    // A keyboard request that was never serviced, or a result nobody read,
+    // must not fire the next time the panel is opened.
+    keyboardRequested_  = false;
+    pendingGotoPage_    = -1;
+    pendingGotoChapter_ = -1;
 }
 
 //-----------------------------------------------------------------------------
@@ -298,6 +303,29 @@ void OverlayPanel::renderControls(C3D_RenderTarget* target, const Theme& theme) 
 }
 
 //-----------------------------------------------------------------------------
+// serviceKeyboard — see overlay.h. NO C3D FRAME MAY BE OPEN.
+//-----------------------------------------------------------------------------
+void OverlayPanel::serviceKeyboard() {
+    keyboardRequested_ = false;
+    if (!open_) return;
+
+    SwkbdState swkbd;
+    swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 2, 6);
+    swkbdSetHintText(&swkbd, gotoMode_ == GotoMode::Page ? "Page number"
+                                                         : "Chapter number");
+    char kbuf[128] = {};
+    SwkbdButton btn = swkbdInputText(&swkbd, kbuf, sizeof(kbuf));
+    if (btn != SWKBD_BUTTON_CONFIRM) return;
+
+    gotoBuf_ = kbuf;
+    const int entered = std::atoi(kbuf);
+    // The panel counts from 1; everything downstream counts from 0. A blank or
+    // zero entry lands on -1, which the caller ignores.
+    if (gotoMode_ == GotoMode::Page) pendingGotoPage_    = entered - 1;
+    else                             pendingGotoChapter_ = entered - 1;
+}
+
+//-----------------------------------------------------------------------------
 // Update (input)
 //-----------------------------------------------------------------------------
 bool OverlayPanel::update(u32 keysDown, const touchPosition& touch, bool touchReleased,
@@ -308,6 +336,13 @@ bool OverlayPanel::update(u32 keysDown, const touchPosition& touch, bool touchRe
     gotoPage     = -1;
     gotoChapter  = -1;
     gotoBookmark = -1;
+
+    // Deliver a Go-To typed on the system keyboard. serviceKeyboard() runs
+    // between frames and cannot report through these out-params itself, so it
+    // parks the result and the next call hands it over — which keeps the
+    // caller's "consume it on the frame it is reported" contract intact.
+    if (pendingGotoPage_ >= 0)    { gotoPage    = pendingGotoPage_;    pendingGotoPage_    = -1; }
+    if (pendingGotoChapter_ >= 0) { gotoChapter = pendingGotoChapter_; pendingGotoChapter_ = -1; }
 
     // B or Start: close
     if ((keysDown & KEY_B) || (keysDown & KEY_START)) { close(); return true; }
@@ -391,19 +426,9 @@ bool OverlayPanel::update(u32 keysDown, const touchPosition& touch, bool touchRe
             gotoBuf_.clear();
         }
 
-        if (keysDown & KEY_Y) {
-            // Invoke software keyboard
-            SwkbdState swkbd;
-            swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 2, 6);
-            swkbdSetHintText(&swkbd, gotoMode_ == GotoMode::Page ? "Page number" : "Chapter number");
-            char kbuf[128] = {};
-            SwkbdButton btn = swkbdInputText(&swkbd, kbuf, sizeof(kbuf));
-            if (btn == SWKBD_BUTTON_CONFIRM) {
-                gotoBuf_ = kbuf;
-                if (gotoMode_ == GotoMode::Page) gotoPage    = std::atoi(kbuf) - 1;
-                else                             gotoChapter = std::atoi(kbuf) - 1;
-            }
-        }
+        // Only REQUEST the keyboard. Launching the applet from here would do
+        // it inside main.cpp's open C3D frame — see serviceKeyboard().
+        if (keysDown & KEY_Y) keyboardRequested_ = true;
 
         if ((keysDown & KEY_A) && !gotoBuf_.empty()) {
             if (gotoMode_ == GotoMode::Page) gotoPage    = std::atoi(gotoBuf_.c_str()) - 1;

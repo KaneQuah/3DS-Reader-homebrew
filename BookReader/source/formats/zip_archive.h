@@ -72,6 +72,11 @@ private:
     std::unordered_map<std::string, Entry> entries_;
     std::vector<std::string>               order_;
 
+    /// Size of the open file. Entry offsets and sizes are read straight out of
+    /// the archive and used as allocation sizes, so they are checked against
+    /// this rather than trusted — see MAX_ENTRY_BYTES in zip_archive.cpp.
+    long                                   fileSize_ = 0;
+
     /// Locate the End Of Central Directory record by scanning backwards.
     bool findEndOfCentralDirectory(long& cdOffset, uint16_t& cdCount, uint32_t& cdSize);
     bool readCentralDirectory(long cdOffset, uint16_t cdCount, uint32_t cdSize);

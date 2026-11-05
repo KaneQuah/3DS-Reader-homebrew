@@ -60,6 +60,26 @@ public:
                 bool& relayout, int& gotoPage, int& gotoChapter,
                 int& gotoBookmark);
 
+    /// True when the Go-To tab has asked for the system software keyboard.
+    /// The caller must service it BETWEEN FRAMES — see serviceKeyboard().
+    bool keyboardRequested() const { return keyboardRequested_; }
+
+    /// Run the system software keyboard and record what was entered.
+    ///
+    /// MUST NOT be called with a C3D frame open. swkbdInputText() launches an
+    /// APT library applet: it suspends this application, hands the GPU to the
+    /// keyboard, and runs the APT suspend/restore hooks (which in this app
+    /// write to the SD card). update() used to call it inline, from inside the
+    /// frame main.cpp has open around the whole state machine — the same
+    /// "long, blocking, GPU-owning work inside an open frame" that the rest of
+    /// this codebase goes out of its way to defer, and which leaves citro3d's
+    /// command buffer open across the applet switch.
+    ///
+    /// The result is reported through the next update() call's `gotoPage` /
+    /// `gotoChapter` out-params, so the caller's existing handling is
+    /// unchanged.
+    void serviceKeyboard();
+
 private:
     bool open_    = false;
     Tab  tab_     = Tab::Settings;
@@ -113,6 +133,13 @@ private:
     enum class GotoMode { Page, Chapter };
     GotoMode    gotoMode_ = GotoMode::Page;
     std::string gotoBuf_;
+
+    // Software keyboard: requested by update(), run by serviceKeyboard()
+    // between frames, reported back through the next update(). -1 = nothing
+    // pending.
+    bool        keyboardRequested_  = false;
+    int         pendingGotoPage_    = -1;
+    int         pendingGotoChapter_ = -1;
     int         lastChapterCount_ = 0;   // stashed from render() for the hint text
 
     void renderSettings(C3D_RenderTarget* target, const Theme& theme);
