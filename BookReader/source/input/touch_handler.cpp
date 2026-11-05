@@ -16,8 +16,15 @@ TouchGesture TouchHandler::update(const touchPosition& cur, const touchPosition&
 
     if (holding_) {
         holdFrames_++;
-        int dx = std::abs(cur.px - startX_);
-        if (dx > maxDeltaX_) maxDeltaX_ = dx;
+        // Deliberately NOT sampled on the release frame: see the comment in
+        // the release branch below. Sampling (0,0) there drove maxDeltaX_ up
+        // to the full start offset, which is >= TAP_MAX_MOVE_PX for all but a
+        // sliver of the screen — so the tap test below could essentially never
+        // succeed, and taps were reported as swipes or as nothing.
+        if (!released) {
+            int dx = std::abs((int)cur.px - startX_);
+            if (dx > maxDeltaX_) maxDeltaX_ = dx;
+        }
 
         // Long-press detection (fire once)
         if (holdFrames_ == LONG_PRESS_FRAMES && maxDeltaX_ < TAP_MAX_MOVE_PX)
@@ -26,9 +33,18 @@ TouchGesture TouchHandler::update(const touchPosition& cur, const touchPosition&
 
     if (released && holding_) {
         holding_        = false;
-        int deltaX      = cur.px - startX_;
+        // `prev`, not `cur`. On the frame the finger lifts there is no contact
+        // to report, so hidTouchRead() yields (0,0) — measuring the gesture
+        // against that made every release look like a swipe toward the origin:
+        // deltaX = -startX_. A tap in the upper-right of the page therefore
+        // registered as SwipeLeft (always "next page"), and TapLeft/TapRight
+        // never fired at all. `prev` is the last position the touchscreen
+        // actually reported while in contact, which is what the gesture has to
+        // be measured against. (This parameter was accepted and then never
+        // read — the fix was already sitting in the signature.)
+        int deltaX      = (int)prev.px - startX_;
         int absDeltaX   = std::abs(deltaX);
-        int absDeltaY   = std::abs(cur.py - startY_);
+        int absDeltaY   = std::abs((int)prev.py - startY_);
 
         // Swipe: significant horizontal movement dominates
         if (absDeltaX >= SWIPE_THRESHOLD_PX && absDeltaX > absDeltaY) {

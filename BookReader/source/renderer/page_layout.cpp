@@ -1,26 +1,15 @@
 #include "renderer/page_layout.h"
 #include "renderer/font_engine.h"
+#include "utf8.h"
 #include <algorithm>
 #include <cctype>
 
 PageLayout g_layout;
 
-//-----------------------------------------------------------------------------
-// UTF-8 decode (duplicate of font_engine.cpp version — consider moving to util)
-//-----------------------------------------------------------------------------
-static uint32_t utf8Next(const char*& p) {
-    uint8_t c = (uint8_t)*p;
-    if (c == 0) return 0;
-    p++;
-    if (c < 0x80) return c;
-    uint32_t cp; int extra;
-    if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
-    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
-    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
-    else return 0xFFFD;
-    while (extra-- > 0) { uint8_t b = (uint8_t)*p++; cp = (cp<<6)|(b&0x3F); }
-    return cp;
-}
+// The local utf8Next() that used to sit here — the copy whose comment said
+// "duplicate of font_engine.cpp version" — read past the end of the buffer on
+// a truncated multi-byte sequence, with no continuation-byte check at all.
+// Both copies are now one shared implementation in include/utf8.h.
 
 //-----------------------------------------------------------------------------
 // Tokenise: split into words, spaces, newlines, and page-break markers
@@ -172,7 +161,7 @@ void PageLayout::breakLines(int pageW, int ptSize, bool justify, bool useKnuthPl
 //-----------------------------------------------------------------------------
 // Paginate: group lines into pages based on available height
 //-----------------------------------------------------------------------------
-void PageLayout::paginateLines(int pageH, int ptSize, float lineSpacingMul) {
+void PageLayout::paginateLines(int pageHEven, int pageHOdd, int ptSize, float lineSpacingMul) {
     int lh = static_cast<int>(g_fontEngine.lineHeight(ptSize) * lineSpacingMul);
     if (lh < 1) lh = ptSize + 2;
 
@@ -181,12 +170,25 @@ void PageLayout::paginateLines(int pageH, int ptSize, float lineSpacingMul) {
     cur.lineStart = 0;
     cur.lineEnd   = 0;
 
+    // Which screen the page being filled will be shown on. Page 0 is the top
+    // screen (taller), page 1 the bottom (shorter), alternating from there —
+    // see the comment on run() in page_layout.h. pages_.size() is the index of
+    // the page currently being accumulated, so its parity selects the height.
+    auto heightFor = [&](size_t pageIndex) {
+        return (pageIndex % 2 == 0) ? pageHEven : pageHOdd;
+    };
+    int pageH = heightFor(0);
+
     for (size_t i = 0; i < lines_.size(); i++) {
         // Explicit page break: close the current page and resume *after* the
         // marker, so it never becomes part of a page's line range and never
         // reaches the renderer.
         if (lines_[i].isPageBreak) {
-            if (cur.lineStart < i) { cur.lineEnd = i; pages_.push_back(cur); }
+            if (cur.lineStart < i) {
+                cur.lineEnd = i;
+                pages_.push_back(cur);
+                pageH = heightFor(pages_.size());
+            }
             cur.lineStart = i + 1;
             cur.lineEnd   = i + 1;
             y = 0;
@@ -196,6 +198,7 @@ void PageLayout::paginateLines(int pageH, int ptSize, float lineSpacingMul) {
         if (y + lh > pageH && cur.lineStart < i) {
             cur.lineEnd = i;
             pages_.push_back(cur);
+            pageH = heightFor(pages_.size());
             cur.lineStart = i;
             y = 0;
         }
@@ -213,7 +216,7 @@ void PageLayout::paginateLines(int pageH, int ptSize, float lineSpacingMul) {
 #include "trace.h"
 
 void PageLayout::run(const std::string& utf8Text,
-                     int pageW, int pageH,
+                     int pageW, int pageHEven, int pageHOdd,
                      int ptSize, float lineSpacingMul,
                      bool justify, bool useKnuthPlass) {
     clear();
@@ -221,7 +224,7 @@ void PageLayout::run(const std::string& utf8Text,
     TRACE("    tokenise: %u tokens", (unsigned)tokens_.size());
     breakLines(pageW, ptSize, justify, useKnuthPlass);
     TRACE("    breakLines: %u lines", (unsigned)lines_.size());
-    paginateLines(pageH, ptSize, lineSpacingMul);
+    paginateLines(pageHEven, pageHOdd, ptSize, lineSpacingMul);
     TRACE("    paginate: %u pages", (unsigned)pages_.size());
 }
 

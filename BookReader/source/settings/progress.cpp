@@ -162,6 +162,59 @@ static int parseInt(const char*& p) {
     return v * sign;
 }
 
+//-----------------------------------------------------------------------------
+// skipValue — consume one JSON value of any shape, so a key this parser does
+// not recognise cannot stall it.
+//
+// Every loop in load() relies on each iteration consuming at least one
+// character. parseInt() does not: handed a value that is not a number it
+// returns 0 with `p` exactly where it started. In the bookmarks array that was
+// an infinite loop — the "legacy bare page index" branch called
+// `(void)parseInt(p)` for any element that was not a nested array, so a
+// progress.json containing
+//
+//     "bookmarks": ["x"]
+//
+// spun forever at startup, before the first frame was ever drawn. Elsewhere
+// (an unrecognised object key) nothing consumed the value at all, which did
+// not hang but silently abandoned the rest of the file, dropping every book
+// after the offending entry.
+//
+// Returns false when the input is exhausted, which tells the caller to stop
+// rather than keep looping on a truncated file.
+//-----------------------------------------------------------------------------
+static bool skipValue(const char*& p) {
+    p = skipWS(p);
+    switch (*p) {
+        case '\0':
+            return false;
+        case '"':
+            parseString(p);
+            return true;
+        case '{':
+        case '[': {
+            const char open  = *p;
+            const char close = (open == '{') ? '}' : ']';
+            int depth = 0;
+            while (*p) {
+                // Strings are consumed whole so a brace inside one cannot
+                // throw the depth count off.
+                if (*p == '"')        { parseString(p); continue; }
+                if (*p == open)       { depth++; p++; continue; }
+                if (*p == close)      { depth--; p++; if (depth <= 0) return true; continue; }
+                p++;
+            }
+            return false;   // unterminated
+        }
+        default: {
+            // Number, true, false, null, or junk: run to the next separator.
+            const char* start = p;
+            while (*p && *p != ',' && *p != '}' && *p != ']') p++;
+            return p != start;
+        }
+    }
+}
+
 bool ProgressStore::load(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) return false;
@@ -217,6 +270,7 @@ bool ProgressStore::load(const char* path) {
                 if (match(p, '[')) {
                     while (true) {
                         p = skipWS(p);
+                        if (*p == '\0') break;         // truncated file
                         if (*p == ']') { p++; break; }
                         if (*p == ',') { p++; continue; }
                         if (*p == '[') {
@@ -229,14 +283,23 @@ bool ProgressStore::load(const char* path) {
                             match(p, ']');
                             bp.bookmarks.push_back(bm);
                         } else {
-                            // Legacy format: a bare global page index. Not
-                            // convertible, so skip it rather than landing the
-                            // user somewhere arbitrary.
-                            (void)parseInt(p);
+                            // Legacy format: a bare global page index, which is
+                            // not convertible to (chapter, spread) without
+                            // laying out the whole book — or outright junk.
+                            // Either way it is skipped rather than landing the
+                            // user somewhere arbitrary. skipValue() guarantees
+                            // progress, which `parseInt` did not: see its
+                            // comment for the startup hang that caused.
+                            if (!skipValue(p)) break;
                         }
                     }
                 }
             }
+            // An unrecognised key: consume its value so the rest of the file
+            // still parses. This used to fall through with the value
+            // unconsumed, which ended the parse and dropped every remaining
+            // book.
+            else if (!skipValue(p)) break;
         }
         entries_[key] = bp;
     }

@@ -234,6 +234,33 @@ private:
     int          botPageW_   = PORTRAIT_BOT_W  - 20;
     int          botPageH_   = PORTRAIT_BOT_H  - 20;
 
+    /// Recompute the four page dimensions above from the current margin
+    /// setting.
+    ///
+    /// Shared by loadChapter() and servicePrefetch() because the two MUST
+    /// paginate with identical parameters: a prefetch hit swaps its layout in
+    /// wholesale (see loadChapter), so if the prefetch had been paginated to
+    /// different page heights, the reader would silently start showing pages
+    /// broken for a geometry it is no longer using. servicePrefetch()
+    /// previously computed its own `pw`/`ph` locally from PORTRAIT_TOP_*,
+    /// which is exactly that divergence waiting to happen.
+    void computePageMetrics();
+
+    /// Orientation most recently seen by render(), and the orientation the
+    /// current layout was paginated for.
+    ///
+    /// Which screen a page lands on depends on the orientation (flipped swaps
+    /// the two), and the screens are different heights, so pagination depends
+    /// on it too. render() queues a relayout when the two disagree, which is
+    /// what keeps a flip from putting a top-screen-height page on the shorter
+    /// bottom screen and clipping its last lines.
+    bool         orientFlipped_ = false;
+    bool         layoutFlipped_ = false;
+
+    /// Page heights in (even, odd) page order for the current orientation.
+    int  pageHeightEven() const { return layoutFlipped_ ? botPageH_ : topPageH_; }
+    int  pageHeightOdd()  const { return layoutFlipped_ ? topPageH_ : botPageH_; }
+
     int          spread_     = 0;   // current spread index
     int          totalSpreads_ = 0;
 

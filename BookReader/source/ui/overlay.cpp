@@ -11,11 +11,15 @@ void OverlayPanel::open(Tab tab) {
     tab_    = tab;
     focusRow_  = 0;
     scrollTop_ = 0;
+    lastTouchX_ = -1;
+    lastTouchY_ = -1;
     buildSettingRows();
 }
 
 void OverlayPanel::close() {
     open_ = false;
+    lastTouchX_ = -1;
+    lastTouchY_ = -1;
 }
 
 //-----------------------------------------------------------------------------
@@ -102,6 +106,30 @@ bool OverlayPanel::applySettingChange(int row, int delta) {
         case 10: // TTS speed
             g_config.tts_speed = std::max(80, std::min(300, g_config.tts_speed + delta * 10));
             break;
+        case 11: { // Font File
+            // This row had no case at all, so it rendered as a value the user
+            // could focus and nudge with nothing happening — the only way to
+            // change the font was to hand-edit config.ini.
+            //
+            // Cycles the built-in face plus every TTF/OTF in
+            // /3DS/BookReader/fonts/. Only the NAME is recorded here: actually
+            // loading the face reads from the SD card and rebuilds the glyph
+            // atlas, and this runs inside the frame main.cpp has open. The
+            // load is picked up between frames — see the deferred font-change
+            // block in main.cpp.
+            std::vector<std::string> fonts = g_fontEngine.listFonts();
+            fonts.insert(fonts.begin(), "built-in");
+            const int n = (int)fonts.size();
+            int idx = 0;
+            for (int i = 0; i < n; i++)
+                if (fonts[(size_t)i] == g_config.font_file) idx = i;
+            idx = ((idx + delta) % n + n) % n;
+            g_config.font_file = fonts[(size_t)idx];
+            // New face means new glyph metrics, so the chapter must be
+            // re-laid-out.
+            relayout_flag = true;
+            break;
+        }
         default: break;
     }
     buildSettingRows();
@@ -288,9 +316,26 @@ bool OverlayPanel::update(u32 keysDown, const touchPosition& touch, bool touchRe
     if (keysDown & KEY_L) tab_ = (Tab)(((int)tab_ + TAB_COUNT - 1) % TAB_COUNT);
     if (keysDown & KEY_R) tab_ = (Tab)(((int)tab_ + 1) % TAB_COUNT);
 
-    // Tab switching via touch on tab bar
-    if (touchReleased && touch.py < 26) {
-        int tabIdx = touch.px / TAB_W;
+    // Where the finger was when it lifted. See lastTouchX_/lastTouchY_ in
+    // overlay.h for why the release frame's own coordinates are useless.
+    // relX/relY are -1 unless a release happened on this call with a position
+    // on record, so every touch test below is a no-op otherwise.
+    if (touch.px != 0 || touch.py != 0) {
+        lastTouchX_ = (int)touch.px;
+        lastTouchY_ = (int)touch.py;
+    }
+    int relX = -1, relY = -1;
+    if (touchReleased) {
+        relX = lastTouchX_;
+        relY = lastTouchY_;
+        lastTouchX_ = -1;   // consumed; a later release must not reuse it
+        lastTouchY_ = -1;
+    }
+
+    // Tab switching via touch on tab bar. The bar occupies y < 26 and the
+    // settings rows start at y = 28, so the two regions cannot both match.
+    if (relY >= 0 && relY < 26) {
+        int tabIdx = relX / TAB_W;
         if (tabIdx >= 0 && tabIdx < TAB_COUNT) tab_ = (Tab)tabIdx;
     }
 
@@ -319,10 +364,10 @@ bool OverlayPanel::update(u32 keysDown, const touchPosition& touch, bool touchRe
         if ((keysDown & KEY_DRIGHT) || (keysDown & KEY_CPAD_RIGHT)) { if (applySettingChange(focusRow_, +1)) relayout = true; }
         if (keysDown & KEY_A)      { if (applySettingChange(focusRow_, +1)) relayout = true; }
 
-        // Touch on setting row. touch.py addresses a slot on screen, so the
+        // Touch on setting row. relY addresses a slot on screen, so the
         // scroll offset has to be added back to get the row it names.
-        if (touchReleased && touch.py > SETTINGS_ROW_Y0) {
-            int slot = (touch.py - SETTINGS_ROW_Y0) / ROW_H;
+        if (relY > SETTINGS_ROW_Y0) {
+            int slot = (relY - SETTINGS_ROW_Y0) / ROW_H;
             int row  = scrollTop_ + slot;
             if (slot >= 0 && slot < SETTINGS_VISIBLE_ROWS && row < rows)
                 focusRow_ = row;

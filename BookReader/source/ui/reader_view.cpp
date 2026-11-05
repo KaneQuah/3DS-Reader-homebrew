@@ -127,6 +127,20 @@ int ReaderView::resolveReadableChapter(int index, int step) {
 }
 
 //-----------------------------------------------------------------------------
+// computePageMetrics — see reader_view.h.
+//
+// The 24 px reserved at the bottom of each page is the room renderPageMeta()
+// draws the "P. n / t" label into.
+//-----------------------------------------------------------------------------
+void ReaderView::computePageMetrics() {
+    const int margin = g_config.marginPx();
+    topPageW_ = PORTRAIT_TOP_W - margin * 2;
+    topPageH_ = PORTRAIT_TOP_H - margin * 2 - 24;
+    botPageW_ = PORTRAIT_BOT_W - margin * 2;
+    botPageH_ = PORTRAIT_BOT_H - margin * 2 - 24;
+}
+
+//-----------------------------------------------------------------------------
 // queueNextPrefetch — see "Next-chapter prefetch" in reader_view.h.
 //-----------------------------------------------------------------------------
 void ReaderView::queueNextPrefetch() {
@@ -161,11 +175,10 @@ void ReaderView::servicePrefetch() {
     const std::string& text = chapterTextAt(probe);
     TRACE("prefetch: chapter %d has %u chars", probe, (unsigned)text.size());
 
-    int margin = g_config.marginPx();
-    int pw = PORTRAIT_TOP_W - margin * 2;
-    int ph = PORTRAIT_TOP_H - margin * 2 - 24;
-
-    prefetchLayout_.run(text, pw, ph,
+    // Identical parameters to loadChapter()'s own run() call — see
+    // computePageMetrics().
+    computePageMetrics();
+    prefetchLayout_.run(text, topPageW_, pageHeightEven(), pageHeightOdd(),
                         g_config.font_size, g_config.lineSpacingMul(),
                         g_config.justify, isNew3DS_);
 
@@ -197,14 +210,20 @@ bool ReaderView::loadChapter(int index, bool landOnLastSpread) {
     if (index < 0 || index >= chapterCount_) return false;
     TRACE("loadChapter(%d, back=%d) of %d", index, (int)landOnLastSpread, chapterCount_);
 
+    // Record which screen assignment this layout is being built for, before
+    // any early return. render() compares it against the live orientation and
+    // queues a relayout when they differ, so leaving it stale on a failed load
+    // would re-queue that relayout on every single frame.
+    //
+    // The prefetch-hit path below is covered by the same assignment: a flip
+    // calls requestRelayout(), which discards the prefetch, so any prefetch
+    // still valid here was built under the current orientation.
+    layoutFlipped_ = orientFlipped_;
+
     const u64 tStart = perfNow();
     lastLoad_ = LoadTiming{};
 
-    int margin = g_config.marginPx();
-    topPageW_  = PORTRAIT_TOP_W - margin * 2;
-    topPageH_  = PORTRAIT_TOP_H - margin * 2 - 24;   // room for page number
-    botPageW_  = PORTRAIT_BOT_W - margin * 2;
-    botPageH_  = PORTRAIT_BOT_H - margin * 2 - 24;
+    computePageMetrics();
 
     // Prefetch hit: the forward-turn common case. The layout for this exact
     // chapter was already computed while the user was sitting on the
@@ -256,7 +275,11 @@ bool ReaderView::loadChapter(int index, bool landOnLastSpread) {
 
     // New 3DS has the headroom for Knuth-Plass line breaking; Old 3DS uses greedy.
     const u64 tLayout = perfNow();
-    g_layout.run(text, topPageW_, topPageH_,
+    // Even pages are shown on the top screen, odd pages on the shorter bottom
+    // screen, so each parity is paginated to its own height — passing only the
+    // top screen's here is what silently dropped the last few lines of every
+    // right-hand page. See PageLayout::run().
+    g_layout.run(text, topPageW_, pageHeightEven(), pageHeightOdd(),
                  g_config.font_size, g_config.lineSpacingMul(),
                  g_config.justify, isNew3DS_);
     lastLoad_.layout = perfMsSince(tLayout);
@@ -330,6 +353,8 @@ void ReaderView::close() {
     chapterCount_ = 0;
     spread_       = 0;
     totalSpreads_ = 0;
+    layoutFlipped_ = false;
+    orientFlipped_ = false;
     bookmarks_.clear();
     docType_      = DocType::Unknown;
 }
@@ -389,6 +414,16 @@ void ReaderView::setupPortraitProjection(C3D_RenderTarget* target, int portW, in
 void ReaderView::render(C3D_RenderTarget* topTarget, C3D_RenderTarget* botTarget,
                         const Theme& theme, const GyroHandler::Orientation& orient,
                         float flipAlpha) {
+    // A flip swaps which screen shows which page, and the screens are
+    // different heights, so the chapter has to be re-paginated for the new
+    // assignment — otherwise the taller (top-screen) pages would land on the
+    // bottom screen and renderReflowPage() would clip their last lines, which
+    // is the same silent text loss that passing one height everywhere caused.
+    // requestRelayout() only sets a flag; main.cpp services it between frames.
+    orientFlipped_ = (orient != GyroHandler::Orientation::Normal);
+    if (!isFixedLayout_ && chapterCount_ > 0 && orientFlipped_ != layoutFlipped_)
+        requestRelayout();
+
     int topPage, botPage;
     if (orient == GyroHandler::Orientation::Normal) {
         topPage = spread_ * 2;      // verso (left/even)

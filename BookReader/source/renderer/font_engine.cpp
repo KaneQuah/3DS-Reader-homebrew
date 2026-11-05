@@ -1,4 +1,5 @@
 #include "renderer/font_engine.h"
+#include "utf8.h"
 #include <3ds.h>
 #include <citro2d.h>
 #include <cstdio>
@@ -8,28 +9,9 @@
 
 FontEngine g_fontEngine;
 
-//-----------------------------------------------------------------------------
-// UTF-8 decode: returns the next Unicode codepoint and advances `p`.
-// Returns 0 on end-of-string.
-//-----------------------------------------------------------------------------
-static uint32_t utf8Next(const char*& p) {
-    uint8_t c = (uint8_t)*p;
-    if (c == 0)   return 0;
-    p++;
-    if (c < 0x80) return c;
-    uint32_t cp;
-    int extra;
-    if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
-    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
-    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
-    else return 0xFFFD; // invalid
-    while (extra-- > 0) {
-        uint8_t b = (uint8_t)*p++;
-        if ((b & 0xC0) != 0x80) return 0xFFFD;
-        cp = (cp << 6) | (b & 0x3F);
-    }
-    return cp;
-}
+// utf8Next() lived here as a static function, duplicated in page_layout.cpp,
+// and both copies read past the end of the buffer on a truncated sequence.
+// There is now one correct implementation in include/utf8.h.
 
 //-----------------------------------------------------------------------------
 // FontEngine
@@ -104,11 +86,15 @@ bool FontEngine::loadFont(const std::string& filename) {
     }
 
     if (FT_New_Face(ftLib_, path.c_str(), 0, &ftFace_) != 0) {
-        // Fall back to built-in
+        // Fall back to built-in. The recursive call records curFontFile_, so
+        // currentFont() reports the face that is really in use rather than the
+        // one that was asked for.
         if (filename != "built-in")
             return loadFont("built-in");
+        curFontFile_.clear();
         return false;
     }
+    curFontFile_ = filename;
     return true;
 }
 

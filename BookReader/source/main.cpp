@@ -356,14 +356,23 @@ static void checkBattery() {
 int main() {
     if (!initHardware()) return 1;
 
+    // Load persisted state FIRST. The font engine's initial face is chosen
+    // from g_config.font_file, which is still the compiled-in default
+    // ("built-in") until config.ini has actually been read — so loading the
+    // config afterwards, as this used to, meant a saved font choice was never
+    // applied at startup and the setting appeared to do nothing.
+    g_config.load(CONFIG_PATH);
+    g_progress.load(PROGRESS_PATH);
+
     // Font engine
     if (!g_fontEngine.init()) return 1;
     if (!g_config.font_file.empty() && g_config.font_file != "built-in")
         g_fontEngine.loadFont(g_config.font_file);
-
-    // Load persisted state
-    g_config.load(CONFIG_PATH);
-    g_progress.load(PROGRESS_PATH);
+    // loadFont() falls back to the built-in face if the file is missing or
+    // unreadable. Record what was actually loaded, so the deferred font-change
+    // check in the main loop does not see a permanent mismatch and retry the
+    // same failing file on every frame.
+    g_config.font_file = g_fontEngine.currentFont();
 
     // Apply saved brightness (bright_level is 1–5, matching the hardware range)
     GSPLCD_SetBrightness(GSPLCD_SCREEN_BOTH, g_config.bright_level);
@@ -436,6 +445,29 @@ int main() {
         if (++s_autosaveCounter >= AUTOSAVE_FRAMES) {
             s_autosaveCounter = 0;
             flushProgress();
+        }
+
+        //--- Deferred font change -------------------------------------------
+        // Settings ▸ Font File only records the chosen name (see
+        // applySettingChange() in overlay.cpp). Loading the face is an SD read
+        // plus a full glyph-atlas rebuild, which is the same class of work as
+        // a chapter load and belongs here, between frames, not inside the open
+        // C3D frame the overlay's input is handled in.
+        //
+        // Checked before the deferred-work block below so the relayout that
+        // follows is computed with the new face, rather than being run against
+        // the old one and then immediately invalidated.
+        if (g_fontEngine.currentFont() != g_config.font_file) {
+            showLoading("Loading font...", /*portrait=*/s_state == AppState::Reading);
+            TRACE("font change: %s -> %s", g_fontEngine.currentFont().c_str(),
+                  g_config.font_file.c_str());
+            g_fontEngine.loadFont(g_config.font_file);
+            // Sync back what actually loaded: a missing file falls back to the
+            // built-in face, and without this the mismatch would persist and
+            // re-trigger this block on every frame.
+            g_config.font_file = g_fontEngine.currentFont();
+            if (s_state == AppState::Reading) g_reader.requestRelayout();
+            continue;   // start a clean frame next iteration
         }
 
         //--- Deferred book open -------------------------------------------

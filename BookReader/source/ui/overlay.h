@@ -65,6 +65,24 @@ private:
     Tab  tab_     = Tab::Settings;
     int  focusRow_ = 0;
 
+    /// Last position the touchscreen actually reported, or -1 for "nothing
+    /// recorded".
+    ///
+    /// hidTouchRead() yields (0,0) on the frame the finger lifts, because
+    /// there is no contact left to report — so the release frame's own
+    /// coordinates cannot be used to decide what was touched. update() used
+    /// them anyway: `touchReleased && touch.py < 26` was therefore true for
+    /// EVERY release, so any touch anywhere in the panel jumped to the
+    /// Settings tab (0 / TAB_W = tab 0), and the settings-row branch, which
+    /// needs py > 28, could never run at all.
+    ///
+    /// update() runs every frame while the panel is open, so remembering the
+    /// last reported position gives the release the position the finger was
+    /// actually at. Unlike ReaderView, the overlay is not handed touchDown, so
+    /// this is tracked here rather than taken as a parameter.
+    int  lastTouchX_ = -1;
+    int  lastTouchY_ = -1;
+
     /// Index of the first settings row drawn. The panel only has room for
     /// SETTINGS_VISIBLE_ROWS at a time, and renderSettings() used to draw from
     /// row 0 and stop when it ran out of space — so every row past the sixth

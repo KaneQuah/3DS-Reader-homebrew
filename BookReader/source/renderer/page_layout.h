@@ -61,15 +61,27 @@ struct Page {
 // PageLayout — tokenise, measure, line-break, paginate (§9.3)
 //
 // Usage:
-//   layout.run(text, pageW, pageH, ptSize, lineSpacingMul, justify, marginPx)
+//   layout.run(text, pageW, pageHEven, pageHOdd, ptSize, lineSpacingMul, justify)
 //   Then iterate pages and render lines.
 //-----------------------------------------------------------------------------
 class PageLayout {
 public:
     // Tokenise and paginate a UTF-8 plain-text string.
-    // pageW / pageH are in portrait pixels (e.g. 220, 380 for top screen with 10px margins).
+    //
+    // pageW and both heights are in portrait pixels. The two heights exist
+    // because the two screens are not the same size: in portrait the top
+    // screen is 240×400 and the bottom is 240×320. A spread shows page 2S on
+    // the top screen and page 2S+1 on the bottom, so EVEN pages are filled to
+    // `pageHEven` (top) and ODD pages to `pageHOdd` (bottom).
+    //
+    // This used to take a single height, and the one caller passed the TOP
+    // screen's. Every page was therefore filled to ~356 px while
+    // renderReflowPage() stops drawing at the bottom screen's ~310 px — so the
+    // last two or three lines of every right-hand page were never drawn, and
+    // because the next page resumes at the following line index, they were
+    // never shown anywhere. Text was silently lost on every odd page.
     void run(const std::string& utf8Text,
-             int pageW, int pageH,
+             int pageW, int pageHEven, int pageHOdd,
              int ptSize, float lineSpacingMul,
              bool justify, bool useKnuthPlass = false);
 
@@ -89,7 +101,7 @@ private:
 
     void tokenise(const std::string& utf8, int ptSize);
     void breakLines(int pageW, int ptSize, bool justify, bool useKnuthPlass);
-    void paginateLines(int pageH, int ptSize, float lineSpacingMul);
+    void paginateLines(int pageHEven, int pageHOdd, int ptSize, float lineSpacingMul);
 
     // Greedy line-break
     void greedyBreak(int pageW, int ptSize);

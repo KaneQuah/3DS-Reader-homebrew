@@ -47,6 +47,15 @@ public:
     // Returns false on failure; falls back to built-in automatically.
     bool loadFont(const std::string& filename);
 
+    /// The face currently loaded, as a filename, or "built-in".
+    ///
+    /// This is what was ACTUALLY loaded, which is not always what loadFont()
+    /// was asked for: a missing or unreadable font file silently falls back to
+    /// the built-in face. Callers that drive font changes off a config value
+    /// need to know the difference, or they re-request the same failing file
+    /// forever.
+    const std::string& currentFont() const { return curFontFile_; }
+
     // Measure the pixel width of a UTF-32 codepoint at the current size
     int  glyphAdvance(uint32_t codepoint);
 
@@ -85,6 +94,9 @@ private:
 
     FT_Library  ftLib_      = nullptr;
     FT_Face     ftFace_     = nullptr;
+
+    // Filename of the loaded face — see currentFont().
+    std::string curFontFile_;
 
     // Size currently programmed into ftFace_, so setSize() can skip the
     // FT_Set_Char_Size round trip when nothing has changed. -1 means unknown

@@ -220,11 +220,36 @@ std::string FileBrowser::update(u32 keysDown, u32 keysHeld,
             ctxMenuOpen_ = false;
         }
         if (keysDown & KEY_B) { ctxMenuOpen_ = false; }
-        // Touch on context menu options
+
+        // Touch on context menu options.
+        //
+        // The release frame reports (0,0) — there is no contact left to read —
+        // so the position has to be the one recorded when the finger went
+        // down. Using the release frame's own coordinates meant row came out
+        // as (0 - 40) / 40 = -1 and the `py > 200` cancel never fired either,
+        // so the menu could not be used by touch at all.
+        if (touchDown && !touchHolding_) {
+            touchStartY_  = (int)touch.py;
+            touchHolding_ = true;
+        }
         if (touchReleased) {
-            int row = (touch.py - 40) / 40;
-            if (row >= 0 && row < 3) { ctxSel_ = row; ctxAction_ = (ContextAction)(row + 1); ctxMenuOpen_ = false; }
-            if (touch.py > 200) ctxMenuOpen_ = false;
+            touchHolding_ = false;
+            holdFrames_   = 0;
+            // touchStartY_ < 0 marks the contact that opened this menu by
+            // long-pressing a list row (see below): that finger's position
+            // refers to the list underneath, not to a menu option, so its
+            // release must not select anything.
+            if (touchStartY_ >= 0) {
+                int row = (touchStartY_ - 40) / 40;   // options drawn at 40 + i*40
+                if (touchStartY_ >= 40 && row >= 0 && row < 3) {
+                    ctxSel_      = row;
+                    ctxAction_   = (ContextAction)(row + 1);
+                    ctxMenuOpen_ = false;
+                } else if (touchStartY_ > 200) {      // the "[B]=Cancel" strip
+                    ctxMenuOpen_ = false;
+                }
+            }
+            touchStartY_ = 0;
         }
         return "";
     }
@@ -251,33 +276,48 @@ std::string FileBrowser::update(u32 keysDown, u32 keysHeld,
 
     // Touch input
     if (touchDown && !touchHolding_) {
-        touchStartY_  = touch.py;
+        touchStartY_  = (int)touch.py;
         touchHolding_ = true;
         holdFrames_   = 0;
     }
     if (touchHolding_) {
         holdFrames_++;
         // Long press detection
-        if (holdFrames_ == LONG_PRESS_FRAMES) {
+        if (holdFrames_ == LONG_PRESS_FRAMES && touchStartY_ >= 0) {
             int row = scrollOffset_ + touchStartY_ / ROW_H;
             if (row >= 0 && row < (int)entries_.size()) {
                 ctxEntry_    = row;
                 ctxSel_      = 0;
                 ctxMenuOpen_ = true;
                 if (longPressPath) *longPressPath = entries_[row].fullPath;
+                // The finger is still down. Mark this contact as spent so the
+                // release that ends it cannot also be read as a tap on a
+                // context-menu option, and reset the hold so the menu starts
+                // from a clean touch state.
+                touchStartY_  = -1;
+                touchHolding_ = false;
+                holdFrames_   = 0;
             }
         }
     }
     if (touchReleased) {
         touchHolding_ = false;
-        if (holdFrames_ < LONG_PRESS_FRAMES) {
-            int row = scrollOffset_ + touch.py / ROW_H;
+        if (holdFrames_ < LONG_PRESS_FRAMES && touchStartY_ >= 0) {
+            // touchStartY_, not touch.py. hidTouchRead() reports (0,0) on the
+            // frame the finger lifts, so `touch.py / ROW_H` was always 0 and
+            // this opened `entries_[scrollOffset_]` — the first visible book —
+            // no matter which row was actually tapped.
+            int row = scrollOffset_ + touchStartY_ / ROW_H;
             if (row >= 0 && row < (int)entries_.size()) {
                 selected_ = row;
                 ensureVisible();
+                touchStartY_ = 0;
+                holdFrames_  = 0;
                 return entries_[selected_].fullPath;  // open on tap
             }
         }
+        touchStartY_ = 0;
+        holdFrames_  = 0;
     }
 
     return "";
